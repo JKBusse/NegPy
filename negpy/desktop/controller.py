@@ -210,11 +210,12 @@ class AppController(QObject):
             self.set_status("NO SUPPORTED ASSETS FOUND", 3000)
             self.status_progress_requested.emit(0, 0)
 
-    def load_file(self, file_path: str) -> None:
+    def load_file(self, file_path: str, preserve_zoom: bool = False) -> None:
         """
         Dispatches RAW decode to a background worker to keep the UI thread free.
         """
-        self.zoom_requested.emit(1.0)
+        if not preserve_zoom:
+            self.zoom_requested.emit(1.0)
         self.set_status(f"Loading {os.path.basename(file_path)}...")
         self.loading_started.emit()
         self._first_render_done = False
@@ -229,6 +230,7 @@ class AppController(QObject):
                 file_path=file_path,
                 workspace_color_space=self.state.workspace_color_space,
                 use_camera_wb=self.state.config.exposure.use_camera_wb,
+                full_resolution=self.state.hq_preview,
             )
         )
 
@@ -237,6 +239,11 @@ class AppController(QObject):
         self.state.original_res = dims
         self.state.current_file_path = file_path
         self.request_render()
+
+    def toggle_hq_preview(self) -> None:
+        self.state.hq_preview = not self.state.hq_preview
+        if self.state.current_file_path:
+            self.load_file(self.state.current_file_path, preserve_zoom=True)
 
     def handle_canvas_clicked(self, nx: float, ny: float) -> None:
         if self.state.active_tool == ToolMode.WB_PICK:
@@ -510,11 +517,16 @@ class AppController(QObject):
             return
 
         self.set_status("Rendering...")
+        
+        target_size = float(APP_CONFIG.preview_render_size)
+        if self.state.hq_preview and self.state.preview_raw is not None:
+            target_size = float(max(self.state.preview_raw.shape[:2]))
+
         task = RenderTask(
             buffer=self.state.preview_raw,
             config=self.state.config,
             source_hash=self.state.current_file_hash or "preview",
-            preview_size=float(APP_CONFIG.preview_render_size),
+            preview_size=target_size,
             icc_profile_path=self.state.icc_profile_path,
             icc_invert=self.state.icc_invert,
             color_space=self.state.workspace_color_space,
