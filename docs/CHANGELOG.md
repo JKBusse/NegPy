@@ -6,6 +6,7 @@
 - Fix: **D-Range Clip** slider now uses a logarithmic scale for much finer control at low values.
 - Fix: **Autocrop Offset** maximum raised to 100, allowing larger offsets on wide-border scans.
 - Fix: 16-bit colour TIFF exports now use a proper 16-bit ICC colour transform.
+- Fix: copy-pasted edits not persisting without additional manual change or explicit "Save".
 - UX: Added empty-state overlay on the canvas when no image is loaded.
 - Performance & stability improvements.
 

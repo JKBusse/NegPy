@@ -511,7 +511,7 @@ class DesktopSessionManager(QObject):
         if self.state.clipboard and self.state.current_file_hash:
             import copy
 
-            self.update_config(copy.deepcopy(self.state.clipboard))
+            self.update_config(copy.deepcopy(self.state.clipboard), persist=True)
             self.settings_pasted.emit()
 
     def add_files(self, file_paths: List[str], validated_info: Optional[List[Dict]] = None) -> None:
