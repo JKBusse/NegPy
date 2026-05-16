@@ -22,11 +22,13 @@ from negpy.desktop.workers.render import (
     ThumbnailUpdateTask,
     ThumbnailWorker,
 )
+from negpy.desktop.workers.scan_worker import ScanRequest, ScanWorker
 from negpy.features.exposure.logic import (
     calculate_wb_shifts,
     calculate_wb_shifts_from_log,
 )
 from negpy.features.geometry.logic import apply_fine_rotation, detect_closest_aspect_ratio
+from negpy.features.process.models import invalidate_local_bounds
 from negpy.infrastructure.filesystem.watcher import FolderWatchService
 from negpy.infrastructure.gpu.resources import GPUTexture
 from negpy.infrastructure.storage.local_asset_store import LocalAssetStore
@@ -64,6 +66,13 @@ class AppController(QObject):
     status_message_requested = pyqtSignal(str, int)
     status_progress_requested = pyqtSignal(int, int)
     pixel_readout = pyqtSignal(str, str)
+    scan_devices_requested = pyqtSignal()
+    scan_requested = pyqtSignal(ScanRequest)
+    scan_devices_ready = pyqtSignal(list)
+    scan_progress = pyqtSignal(float)
+    scan_finished = pyqtSignal(str)
+    scan_error = pyqtSignal(str)
+    scan_started = pyqtSignal()
 
     def __init__(self, session_manager: DesktopSessionManager):
         super().__init__()
@@ -110,6 +119,11 @@ class AppController(QObject):
         self.preview_load_worker = PreviewLoadWorker(self.preview_service)
         self.preview_load_worker.moveToThread(self.preview_load_thread)
         self.preview_load_thread.start()
+
+        self.scan_thread = QThread()
+        self.scan_worker = ScanWorker()
+        self.scan_worker.moveToThread(self.scan_thread)
+        self.scan_thread.start()
 
         self.canvas: Any = None
         self._is_rendering = False
@@ -213,9 +227,17 @@ class AppController(QObject):
         self.preview_load_worker.finished.connect(self._on_preview_loaded)
         self.preview_load_worker.error.connect(self._on_render_error)
 
+        self.scan_devices_requested.connect(self.scan_worker.list_devices)
+        self.scan_worker.devices_ready.connect(self.scan_devices_ready.emit)
+        self.scan_worker.progress.connect(self.scan_progress.emit)
+        self.scan_worker.finished.connect(self._on_scan_finished)
+        self.scan_worker.error.connect(self.scan_error.emit)
+        self.scan_requested.connect(self.scan_worker.run_scan)
+
         self.session.file_selected.connect(self.load_file)
         self.session.state_changed.connect(self.config_updated.emit)
         self.session.state_changed.connect(self._render_debounce.start)
+        self.session.files_changed.connect(self._render_debounce.start)
 
     def generate_missing_thumbnails(self) -> None:
         missing = [f for f in self.state.uploaded_files if f["name"] not in self.state.thumbnails]
@@ -260,9 +282,14 @@ class AppController(QObject):
         Adds discovered assets to the session and starts thumbnail generation.
         """
         self._discovery_running = False
+        pending_scan = getattr(self, "_pending_scanned_file", None)
         if valid_assets:
             self.session.add_files([], validated_info=valid_assets)
             self.generate_missing_thumbnails()
+            # If this was a scan result, auto-select the file
+            if pending_scan:
+                self._select_file_by_path(pending_scan)
+                self._pending_scanned_file = None
         else:
             self.set_status("NO SUPPORTED ASSETS FOUND", 3000)
             self.status_progress_requested.emit(0, 0)
@@ -335,7 +362,7 @@ class AppController(QObject):
             ),
             auto_crop_enabled=False,
         )
-        new_proc = replace(self.state.config.process, local_floors=(0.0, 0.0, 0.0), local_ceils=(0.0, 0.0, 0.0))
+        new_proc = replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process))
         self.session.update_config(replace(self.state.config, geometry=new_geo, process=new_proc))
         self.state.active_tool = ToolMode.NONE
         self.tool_sync_requested.emit()
@@ -349,7 +376,7 @@ class AppController(QObject):
         self.request_render()
 
     def reset_crop(self) -> None:
-        new_proc = replace(self.state.config.process, local_floors=(0.0, 0.0, 0.0), local_ceils=(0.0, 0.0, 0.0))
+        new_proc = replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process))
         self.session.update_config(
             replace(
                 self.state.config,
@@ -360,7 +387,7 @@ class AppController(QObject):
         self.request_render()
 
     def apply_auto_crop(self) -> None:
-        new_proc = replace(self.state.config.process, local_floors=(0.0, 0.0, 0.0), local_ceils=(0.0, 0.0, 0.0))
+        new_proc = replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process))
         self.session.update_config(
             replace(
                 self.state.config,
@@ -394,7 +421,7 @@ class AppController(QObject):
         if new_ratio == geom.autocrop_ratio:
             return
 
-        new_proc = replace(self.state.config.process, local_floors=(0.0, 0.0, 0.0), local_ceils=(0.0, 0.0, 0.0))
+        new_proc = replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process))
         self.session.update_config(
             replace(
                 self.state.config,
@@ -622,11 +649,37 @@ class AppController(QObject):
         """
         new_process = replace(
             self.state.config.process,
-            local_floors=(0.0, 0.0, 0.0),
-            local_ceils=(0.0, 0.0, 0.0),
+            **invalidate_local_bounds(self.state.config.process),
         )
         self.session.update_config(replace(self.state.config, process=new_process))
         self.request_render()
+
+    # ── Scanner integration ───────────────────────────────────────────
+
+    def request_scan_devices(self) -> None:
+        """Request device enumeration on the scan worker thread."""
+        self.scan_devices_requested.emit()
+
+    def start_scan(self, req: ScanRequest) -> None:
+        """Start a scan. The UI connects to scan signals for state updates."""
+        self.scan_started.emit()
+        self.scan_requested.emit(req)
+
+    def cancel_scan(self) -> None:
+        self.scan_worker.cancel()
+
+    def _on_scan_finished(self, path: str) -> None:
+        """Auto-add scanned file to NegPy file list and select it."""
+        self.scan_finished.emit(path)
+        self._pending_scanned_file = path
+        self.request_asset_discovery([path])
+
+    def _select_file_by_path(self, path: str) -> None:
+        """Find a file by path in uploaded_files and select it."""
+        for i, f_info in enumerate(self.session.state.uploaded_files):
+            if f_info.get("path") == path:
+                self.session.select_file(i)
+                return
 
     def request_render(self, readback_metrics: bool = True) -> None:
         """
@@ -825,7 +878,7 @@ class AppController(QObject):
             bounds = metrics.get("log_bounds")
 
             changes = {}
-            if bounds:
+            if bounds and not self.state.config.process.lock_bounds:
                 current = self.state.config.process
                 if bounds.floors != current.local_floors or bounds.ceils != current.local_ceils:
                     changes["local_floors"] = bounds.floors
@@ -906,4 +959,8 @@ class AppController(QObject):
         if self.preview_load_thread.isRunning():
             self.preview_load_thread.quit()
             self.preview_load_thread.wait()
+        self.scan_worker.cancel()
+        if self.scan_thread.isRunning():
+            self.scan_thread.quit()
+            self.scan_thread.wait()
         self.render_worker.destroy_all()

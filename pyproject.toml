@@ -46,6 +46,10 @@ dev = [
     "ruff==0.14.10",
     "ty>=0.0.26",
 ]
+scanner = [
+    "python-sane>=2.8",
+    "pidng>=4.0.9",
+]
 
 [project.urls]
 Homepage = "https://github.com/marcinz606/NegPy"

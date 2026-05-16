@@ -9,6 +9,23 @@ NegPy requires **Python 3.13+**. We use **uv** for environment and dependency ma
 ### 1. Prerequisites
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you haven't already.
 
+**Scanner support (optional):** NegPy's direct scanner integration uses SANE (libsane).
+
+- **Linux** (Debian/Ubuntu):
+  ```bash
+  sudo pacman -S sane  # arch
+  sudo apt install libsane-dev  # debian/ubuntu
+  ```
+
+- **macOS**:
+  ```bash
+  brew install sane-backends
+  ```
+
+- **Windows**: 
+Scanner support is not yet available on windows.
+
+
 ### 2. Python Environment
 The `Makefile` handles synchronization via `uv`. Run this to set up your environment:
 
