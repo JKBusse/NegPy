@@ -439,11 +439,7 @@ class _ScanUnsupportedPlaceholder(QWidget):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        label = QLabel(
-            "Scanner support not available on Windows.\n\n"
-            "NegPy v1 scanner integration uses SANE (libsane),\n"
-            "supported on Linux and macOS only."
-        )
+        label = QLabel("Scanner support not yet available on Windows.")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setWordWrap(True)
         label.setStyleSheet(f"color: {THEME.text_muted}; font-size: {THEME.font_size_base}px; padding: 20px;")
