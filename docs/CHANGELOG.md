@@ -6,6 +6,7 @@
 - Added **IR Dust Removal**: uses the infrared channel from IR-capable scanners (Nikon Coolscan, Epson flatbeds with SilverFast iSRD, VueScan 4-channel output) to detect and inpaint dust and scratches with near-zero false positives. Toggle and threshold slider in the Retouch panel — controls are disabled automatically when no IR channel is present in the loaded file.
 - IR channel is read from: 4-channel TIFFs with ExtraSamples (VueScan, NegPy's own scanner output), multi-page TIFFs with a grayscale IR page (SilverFast iSRD), and `_IR.tif` sidecar files.
 - **Tooltips**: added detailed tooltips to every sidebar control — sliders, buttons, dropdowns, and checkboxes. Controls with keyboard shortcuts show dynamic shortcut chips that update when bindings are customised.
+- **Optimizations**: optimizations to preview loading speed. @reederphill
 
   ## 0.21.0
 
