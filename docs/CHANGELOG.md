@@ -1,5 +1,10 @@
 # Change Log
 
+## 0.27.1
+
+- Fix: the default export colour space is now sRGB instead of Adobe RGB, so exports get a real ICC transform rather than just a wide-gamut tag that many viewers misread as sRGB. **Soft proof** now defaults on so the preview reflects the export colour-space clamp instead of silently diverging from it, and the toggle is surfaced more clearly. Monitor ICC detection failures now log a warning instead of a silent debug message. @reederphil
+- Fix: **crop UX** activating Manual Crop now resets to the full image instead of keeping a stale rect or autocrop from a prior session. The Manual and Auto buttons show a red corner-dot indicator when a crop is active, so it's visible without inspecting the button state. @reederphil
+
 ## 0.27.0
 
 - **Flat-field correction** (new, off by default) — corrects illumination falloff/vignetting from your light source or scanner using a reference scan of the bare light. New **Flat Field** section in the Setup tab: save named reference profiles, pick the active one, and toggle correction per image.
