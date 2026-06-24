@@ -1,5 +1,16 @@
 # Change Log
 
+## 0.29.0
+
+- **Flat master output (new)** — a new "Flat — for editing elsewhere" output intent that exports a flat, neutral, wide-gamut **16-bit TIFF** (or optional **Linear DNG**) digital intermediate for editing in Lightroom/Darktable/Photoshop. Skips the creative print look (auto density/grade, cast removal, lab, toning, finish) and maps camera RAWs to ProPhoto-linear via the camera's own matrix. New **Output Intent** section in Export with a Print/Flat toggle, **Preview Flat** peek and a **Roll Baseline** button for roll-wide consistency. Standard "Print" mode is unaffected. @jboneng
+- **Asymmetric H&D print curve** — reworked exposure/normalization around a film-style characteristic curve with independent toe and shoulder, plus an absolute-percentile colour clip and a luma-decoupled. CPU/GPU parity preserved.
+- **Darkroom paper profiles (reintroduced)** — a paper dropdown in the Exposure panel applies per-paper curve shaping rather than post-processing (tonal, per-channel gamma, base tint) mapped from Ilford/Kodak/Foma/Fuji datasheets. Gated by process mode and sticky roll-wide.
+- **JPEG XL (.jxl) export (new)** — support in python libs is somewhat restricted yet so the UI restricts it to representable spaces (sRGB, Display P3, Rec 2020, Greyscale) and doesn't support embedding custom .icc.
+- **Histogram linear/log toggle** — a **LIN / LOG** pill in the histogram switches the count axis, lifting sparse shadow/highlight detail. Instant repaint, persisted across restarts. @jboneng
+- **Custom crosstalk profiles** — bundled Kodak Gold 200, Portra 400 and VISION3 250D matrices for the Lab Crosstalk control, plus bundled a Claude skill to derive a `.toml` matrix from a film datasheet.
+- File pickers now reopen at your last folder instead of the system root. (#290)
+- Fix: **X-Trans full-res demosaic** uses DHT instead of VNG, removing dot/maze artifacts on Fujifilm sensors. @reederphill
+
 ## 0.28.0
 
 - **Dodge & Burn (new)** — local lighten/darken with freehand **polygon masks**, darkroom-style. Click to drop vertices, double-click (or snap-to-start) to close, and click inside a mask to reselect it; each mask carries its own EV strength and feather radius. Masks are stored in raw-image space and re-projected through the geometry transform, so they survive rotation, flip and crop. The stage runs on the **GPU with bit-for-bit CPU parity**, with a **Show Masks** toggle in the new Local sidebar section. (#274, #275) @reederphill
