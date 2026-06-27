@@ -98,9 +98,9 @@ class RightPanel(QWidget):
             (page["key"], page["icon_name"], page["tooltip"], page["widget"], page["sections"]) for page in self.controls_panel.pages
         ]
         tab_specs += [
+            ("history", "fa5s.history", "History", self.history_panel, []),
             ("export", "fa5s.file-export", "Export", self.export_sidebar, []),
             ("metadata", "fa5s.tags", "Metadata", self.metadata_sidebar, []),
-            ("history", "fa5s.history", "History", self.history_panel, []),
             ("scan", "fa5s.camera-retro", "Scan", self.scan_sidebar, []),
         ]
 
@@ -256,12 +256,14 @@ class RightPanel(QWidget):
         # what the canvas is showing.
         if self.controller.state.flat_peek:
             from negpy.domain.models import flat_master_config
-            from negpy.features.exposure.logic import flat_curve_params
+            from negpy.features.exposure.logic import flat_curve_bounds, flat_curve_params
 
             flat_cfg = flat_master_config(self.controller.session.state.config).exposure
             slope, f_pivot = flat_curve_params()
+            # Compressed bounds so the chart matches the flat render.
+            flat_dmin, flat_dmax = flat_curve_bounds()
             density_range = None
-            self.curve_widget.update_curve(flat_cfg, slope=slope, pivot=f_pivot)
+            self.curve_widget.update_curve(flat_cfg, slope=slope, pivot=f_pivot, d_min_override=flat_dmin, d_max_override=flat_dmax)
         else:
             # Mirror PhotometricProcessor so the plotted curve matches the render under
             # the Auto Grade / Auto Density / Cast Removal toggles. CPU stores
