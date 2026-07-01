@@ -1,6 +1,7 @@
 import gc
 import os
 import struct
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
@@ -11,12 +12,18 @@ from negpy.domain.models import AspectRatio, ExportResolutionMode, WorkspaceConf
 from negpy.features.exposure.normalization import (
     LogNegativeBounds,
     analyze_log_exposure_bounds,
+    analyze_log_exposure_bounds_from_log,
     luma_source_bounds,
     luminance_density_range,
     measure_anchor,
+    measure_anchor_from_log,
     measure_neutral_axis,
+    measure_neutral_axis_from_log,
     measure_shadow_log_refs,
+    measure_shadow_refs_from_log,
     measure_textural_range,
+    measure_textural_range_from_log,
+    prefilter_log_grid,
     resolve_bounds_detailed,
 )
 from negpy.features.geometry.logic import (
@@ -197,6 +204,8 @@ class GPUEngine:
         ]
         self._alignment = UNIFORM_ALIGNMENT_DEFAULT
         self._current_source_hash: Optional[str] = None
+        # Once-per-source guard so the analysis timing log fires on load, not every slider.
+        self._analysis_timing_hash: Optional[str] = None
         # (key, bounds, shadow_refs, metered_anchor, textural_range, neutral_axis) — per-source
         # meter cache so creative-slider previews don't re-run the analysis (see _analysis_*).
         self._analysis_cache: Optional[tuple] = None
@@ -281,6 +290,7 @@ class GPUEngine:
         """Initializes hardware pipelines and persistent buffers."""
         if self._pipelines or not self.gpu.device:
             return
+        t0 = time.perf_counter()
         device = self.gpu.device
         self._sampler = device.create_sampler(min_filter="linear", mag_filter="linear")
 
@@ -308,7 +318,11 @@ class GPUEngine:
             wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
         )
 
-        logger.info("GPU Engine: Hardware resources initialized")
+        logger.info(
+            "load-timing gpu_init %.0fms (compiled %d shaders/pipelines)",
+            (time.perf_counter() - t0) * 1000,
+            len(self._pipelines),
+        )
 
     def _create_pipeline(self, shader_path: str) -> Any:
         shader_module = ShaderLoader.load(shader_path)
@@ -456,6 +470,7 @@ class GPUEngine:
                 neutral_axis_override,
             )
 
+        analysis_t0 = time.perf_counter()
         needs_refs = (
             shadow_refs_override is None
             and not tiling_mode
@@ -472,7 +487,7 @@ class GPUEngine:
         needs_textural = textural_range_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
 
         analysis_source = None
-        analysis_roi = None
+        prefiltered = None
         if needs_bounds_analysis or needs_refs or needs_anchor or needs_textural:
             # Use views to avoid copying the full-res image; crop to ROI first.
             analysis_source = img
@@ -486,67 +501,67 @@ class GPUEngine:
             if analysis_roi is not None:
                 ay1, ay2, ax1, ax2 = analysis_roi
                 analysis_source = np.ascontiguousarray(analysis_source[ay1:ay2, ax1:ax2])
-                analysis_roi = None
             if settings.geometry.fine_rotation != 0.0:
                 analysis_source = apply_fine_rotation(analysis_source, settings.geometry.fine_rotation)
 
             analysis_source = _downsample_for_analysis(analysis_source, APP_CONFIG.preview_render_size)
+            # Shared prefilter, once for all five meters (ROI already applied).
+            prefiltered = prefilter_log_grid(analysis_source, None, settings.process.analysis_buffer)
+
+        def _analyze_bounds() -> LogNegativeBounds:
+            assert prefiltered is not None
+            return analyze_log_exposure_bounds_from_log(
+                prefiltered,
+                None,
+                0.0,
+                process_mode=settings.process.process_mode,
+                e6_normalize=settings.process.e6_normalize,
+                percentile_clip=settings.process.luma_range_clip,
+                color_clip=settings.process.color_range_clip,
+            )
 
         if bounds_override:
             bounds = base_bounds = anchor_bounds = bounds_override
         else:
-            bounds, base_bounds = resolve_bounds_detailed(
-                settings.process,
-                lambda: analyze_log_exposure_bounds(
-                    analysis_source,
-                    analysis_roi,
-                    settings.process.analysis_buffer,
-                    process_mode=settings.process.process_mode,
-                    e6_normalize=settings.process.e6_normalize,
-                    percentile_clip=settings.process.luma_range_clip,
-                    color_clip=settings.process.color_range_clip,
-                ),
-            )
+            bounds, base_bounds = resolve_bounds_detailed(settings.process, _analyze_bounds)
             anchor_bounds = luma_source_bounds(settings.process, base_bounds)
 
         shadow_refs = shadow_refs_override
-        if needs_refs and analysis_source is not None:
-            shadow_refs = measure_shadow_log_refs(
-                analysis_source,
-                analysis_roi,
-                settings.process.analysis_buffer,
-            )
+        if needs_refs and prefiltered is not None:
+            shadow_refs = measure_shadow_refs_from_log(prefiltered, None, 0.0)
 
         # Neutral axis for the two-point Cast Removal; normalized at consumption.
         neutral_axis_refs = neutral_axis_override
-        if needs_refs and analysis_source is not None:
-            neutral_axis_refs = measure_neutral_axis(
-                analysis_source,
-                bounds,
-                analysis_roi,
-                settings.process.analysis_buffer,
-            )
+        if needs_refs and prefiltered is not None:
+            neutral_axis_refs = measure_neutral_axis_from_log(prefiltered, bounds, None, 0.0)
 
         metered_anchor = metered_anchor_override
-        if needs_anchor and analysis_source is not None:
-            metered_anchor = measure_anchor(
-                analysis_source,
-                anchor_bounds,
-                analysis_roi,
-                settings.process.analysis_buffer,
-            )
+        if needs_anchor and prefiltered is not None:
+            metered_anchor = measure_anchor_from_log(prefiltered, anchor_bounds, None, 0.0)
 
         textural_range = textural_range_override
-        if needs_textural and analysis_source is not None:
-            textural_range = measure_textural_range(
-                analysis_source,
-                analysis_roi,
-                settings.process.analysis_buffer,
-            )
+        if needs_textural and prefiltered is not None:
+            textural_range = measure_textural_range_from_log(prefiltered, None, 0.0)
 
         if analysis_key is not None:
             self._analysis_cache = _update_analysis_cache(
                 self._analysis_cache, analysis_key, bounds, shadow_refs, metered_anchor, textural_range, neutral_axis_refs
+            )
+
+        # CPU meter cost, logged once per source (skips creative-slider re-renders).
+        if (
+            analysis_source is not None
+            and analysis_source_hash is not None
+            and analysis_source_hash != self._analysis_timing_hash
+        ):
+            self._analysis_timing_hash = analysis_source_hash
+            logger.info(
+                "load-timing analysis %.0fms (bounds=%s refs=%s anchor=%s textural=%s)",
+                (time.perf_counter() - analysis_t0) * 1000,
+                needs_bounds_analysis,
+                needs_refs,
+                needs_anchor,
+                needs_textural,
             )
 
         pw, ph, cw, ch, ox, oy = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
