@@ -54,6 +54,14 @@ _TONE_FIELDS = (
     "true_black",
     "shadow_density",
     "highlight_density",
+    "shadow_grade",
+    "highlight_grade",
+    "shadow_grade_trim_red",
+    "shadow_grade_trim_green",
+    "shadow_grade_trim_blue",
+    "highlight_grade_trim_red",
+    "highlight_grade_trim_green",
+    "highlight_grade_trim_blue",
     "paper_dmin",
     "auto_exposure",
     "auto_normalize_contrast",
@@ -570,6 +578,9 @@ class ControlsPanel(QWidget):
 
     def _sync_all_sidebars(self) -> None:
         """Force all sidebar panels to update their widgets from current AppState."""
+        from negpy.features.process.models import ProcessMode
+
+        self.colour_section.setVisible(self.controller.state.config.process.process_mode != ProcessMode.BW)
         self.process_sidebar.sync_ui()
         self.roll_sidebar.sync_ui()
         self.colour_sidebar.sync_ui()
