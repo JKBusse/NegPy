@@ -89,20 +89,14 @@ class TestDesktopSessionSync(unittest.TestCase):
             "last_export_config": {},
             "last_auto_exposure": True,
             "last_auto_normalize_contrast": True,
-            "last_cast_removal_strength": 0.5,
-            "last_auto_cast_removal": True,
             "last_paper_dmin": True,
-            "last_surround": True,
             "last_paper_profile": "ilford_mg_rc",
         }
         self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
         config = self.session._apply_sticky_settings(WorkspaceConfig(), only_global=False)
         self.assertTrue(config.exposure.auto_exposure)
         self.assertTrue(config.exposure.auto_normalize_contrast)
-        self.assertEqual(config.exposure.cast_removal_strength, 0.5)
-        self.assertTrue(config.exposure.auto_cast_removal)
         self.assertTrue(config.exposure.paper_dmin)
-        self.assertTrue(config.exposure.surround)
         self.assertEqual(config.exposure.paper_profile, "ilford_mg_rc")
 
     def test_roll_average_not_seeded_onto_fresh_files(self):
