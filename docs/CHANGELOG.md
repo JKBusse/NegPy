@@ -1,6 +1,14 @@
 # Change Log
 
 
+## 0.37.0
+
+- Change: **One healing engine for everything** — Auto Dust and IR removal now use the same texture-preserving clone as the manual Heal tool instead of the old smoothed fill. Hairs and scratches are traced along their length.
+- Change: **Better heals across the board** — clone sources are picked by how well they match the surroundings, heal edges feather with brush size, and the halo around auto-fixed spots is gone.
+- Change: **Dust detection is stable and WYSIWYG** — defects are detected once on the source scan: the detected set no longer shifts while you drag sliders, and preview and export heal exactly the same spots.
+- New: **Auto Dust works on slides** — E-6 positives get automatic dust removal for the first time.
+- Fix: presets no longer embed the source frame's heal strokes, and Apply settings no longer overwrites other frames' heals.
+
 ## 0.36.0
 
 - New: **Camera Scanning** — a new tab captures negatives with a tethered camera and feeds the RGB Scan merge. Two auto-selected modes: **Narrowband RGB** (jackw01's open-source Scanlight flashes red, then green, then blue while the camera captures each exposure) and **normal** (a single exposure under any light, imported as an ordinary RAW). Includes per-channel ETTR auto-calibration metered on the clear film base, film-stock presets, and a live view with the camera's hardware focus magnifier and live ISO/shutter controls. Cameras are detected on the USB bus automatically — no address, login or pairing. macOS and Linux only (verified on Sony bodies, other brands need testing). @light-sntchr
