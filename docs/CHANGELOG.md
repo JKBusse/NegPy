@@ -3,21 +3,33 @@
 
 ## 0.37.0
 
+- New: **Crosstalk matrix editor** — a Manage button beside the Process → Crosstalk dropdown opens an editor: browse the bundled matrices (read-only), make an editable copy, adjust the channel-mixing terms with live preview, and save your own profiles as `.toml` files in the NegPy/crosstalk folder.
+- New: **Editable Dodge & Burn masks** — the panel lists every mask you've drawn; pick one to select it, then reshape it right on the canvas (drag a point to move it, click an edge to add a point, right-click a point to remove it) and tune its sliders — no need to redraw from scratch.
+- New: **Straighten tool** — draw a reference line on the image (ruler button under Geometry → Alignment, key `L`) and the frame rotates to match: lines near horizontal level the horizon, lines near vertical plumb an edge. Composes with Fine Rotation and the crop rotation handles. @linkmodo
+- New: **Iron Blue, Copper and Vanadium Green toners** on the Toning page (B&W only) — navy shadows, pink-to-brick red with weakened blacks, and green mids over black shadows.
+- New: **Spot densitometer** — hover the image to read the pixel under the cursor: per-channel density above film base (ΔD), the print's reflection density, and its print zone (Zone V = 18% grey); a dot tracks the pixel along the H&D curve.
+- New: **Zone strip** — a Zone System bar under the chart shows how much of the print falls in each zone (0–IX) and flags blocked shadows or blown highlights in red.
+- New: **Auto Dust works on slides** — E-6 positives get automatic dust removal for the first time.
 - Change: **One healing engine for everything** — Auto Dust and IR removal now use the same texture-preserving clone as the manual Heal tool instead of the old smoothed fill. Hairs and scratches are traced along their length.
 - Change: **Better heals across the board** — clone sources are picked by how well they match the surroundings, heal edges feather with brush size, and the halo around auto-fixed spots is gone.
 - Change: **Dust detection is stable and WYSIWYG** — defects are detected once on the source scan: the detected set no longer shifts while you drag sliders, and preview and export heal exactly the same spots.
-- New: **Editable Dodge & Burn masks** — the panel lists every mask you've drawn; pick one to select it, then reshape it right on the canvas (drag a point to move it, click an edge to add a point, right-click a point to remove it) and tune its sliders — no need to redraw from scratch.
-- Change: **Smoother masks and scratch heals** — Dodge & Burn mask outlines and Scratch heal strokes now follow smooth curves through their points instead of straight segments, and the line previews curved as you draw it.
-- New: **Auto Dust works on slides** — E-6 positives get automatic dust removal for the first time.
-- New: **Iron Blue, Copper and Vanadium Green toners** on the Toning page (B&W only) — navy shadows, pink-to-brick red with weakened blacks, and green mids over black shadows.
-- Change: **Toner combinations simulate sequential baths** — silver claimed by one toner is locked to the ones after it: selenium before sepia protects the shadows, partial sepia plus iron blue splits green. Single-toner looks are unchanged.
-- Fix: a B&W print toned only with gold or split tints rendered grey in preview and export.
-- New: **Crosstalk matrix editor** — a Manage button beside the Process → Crosstalk dropdown opens an editor: browse the bundled matrices (read-only), make an editable copy, adjust the channel-mixing terms with live preview, and save your own profiles as `.toml` files in the NegPy/crosstalk folder.
 - Change: **One Analysis chart** — the histogram and the H&D curve merge into a single graph: the print's RGB histogram sits behind the curve, and a second grey histogram along the exposure axis shows where the negative's densities land on the paper curve — how much of the image rides the toe, the straight line or the shoulder, live as you drag Grade or Density. The LIN/LOG toggle scales both.
-- New: **Spot densitometer** — hover the image to read the pixel under the cursor: per-channel density above film base (ΔD), the print's reflection density, and its print zone (Zone V = 18% grey); a dot tracks the pixel along the H&D curve.
-- New: **Zone strip** — a Zone System bar under the chart shows how much of the print falls in each zone (0–IX) and flags blocked shadows or blown highlights in red.
+- Change: **Heal & Scratch tools work fully on the canvas** — right-click opens a tool menu (Undo/Clear, Confirm Scratch, and Delete This Heal on a placed patch), the Scratch tool shows a pen cursor, `Ctrl+Z` undoes the last heal and Backspace steps back a scratch point; the two tools are now mutually exclusive and suspend/restore when you leave and return to their tab. The placed-heal outline no longer sits slightly offset from where you clicked. @linkmodo
+- Change: **Toner combinations simulate sequential baths** — silver claimed by one toner is locked to the ones after it: selenium before sepia protects the shadows, partial sepia plus iron blue splits green. Single-toner looks are unchanged.
+- Change: **Smoother masks and scratch heals** — Dodge & Burn mask outlines and Scratch heal strokes now follow smooth curves through their points instead of straight segments, and the line previews curved as you draw it.
+- Change: **Fine Rotation now reads clockwise-positive** — dragging the slider (or the crop handles) to the right turns the image clockwise on screen, the photographer's convention, under every flip. Saved rotations render exactly as before. @linkmodo
+- Change: **Customize Shortcuts redesign** — shortcuts are grouped into collapsible sections with one shortcut per row, slider rows merged with per-control keyboard step sizes, and a search box to jump to an action; the read-only shortcut overview gets the same press-to-search lookup. @jboneng
+- Change: **Camera Scanning presets lock the whole exposure** — a preset now stores the ISO and aperture the film base was metered at alongside the RGB levels and shutter, and re-asserts all of them before every shot, so a bumped dial between scans can't skew a scan. @light-sntchr
+- Change: **Snappier camera live view** — stepping ISO / shutter / aperture waits for you to pause before writing to the body instead of firing a slow write per click, so rapid stepping settles far quicker and no longer flickers back mid-write. @light-sntchr
+- Change: **More reliable auto-calibration** — per-channel ETTR calibration now copes with dense film bases where one channel is much brighter than another: it tolerates a negligible base clip, pulls the LED down until the base truly stops clipping, and settles on the best shutter instead of oscillating. @light-sntchr
 - Change: **Leaner stats read-out** — the numbers below the chart reduce to the essentials: the negative's density range with a development read (flat / normal / contrasty), exposure in EV, and clipping; the scan-clip warning appears only when the scan actually clips.
+- Change: **Smaller TIFF exports** — TIFFs now use ZIP (Deflate) compression with a horizontal predictor instead of LZW, typically 15–25% smaller for 16-bit images with no change to the pixels. @RP2
+- Fix: **camera reconnects cleanly after scanning** — closing the Live View or new-preset calibration window now releases the tethered camera session, so bodies (Fuji especially) that stick in tethered-capture mode no longer hang on the next connection. @bbatha
+- Fix: **export no longer crashes on non-ASCII metadata** — accented or non-Latin characters in a source file's EXIF (e.g. Image Description) previously aborted a TIFF export; they're now safely substituted. @RP2
+- Fix: a B&W print toned only with gold or split tints rendered grey in preview and export.
 - Fix: presets no longer embed the source frame's heal strokes, and Apply settings no longer overwrites other frames' heals.
+- Fix: **numpad keys bind separately** — the shortcut editor no longer collapses `Num+9` onto plain `9`, so numpad and number-row keys can hold different shortcuts. @jboneng
+- Fix: **no more 'surround' warning on load** — edits saved before the old surround control was removed no longer log an unknown-key warning every time you open a file. @linkmodo
 
 ## 0.36.0
 
