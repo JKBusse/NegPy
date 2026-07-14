@@ -164,11 +164,7 @@ def load_slider_steps(repo) -> dict[str, float]:
 
 def save_slider_steps(repo, steps: dict[str, float]) -> None:
     defaults = default_slider_steps()
-    overrides = {
-        group_id: value
-        for group_id, value in steps.items()
-        if group_id in defaults and float(value) != defaults[group_id]
-    }
+    overrides = {group_id: value for group_id, value in steps.items() if group_id in defaults and float(value) != defaults[group_id]}
     repo.save_global_setting("shortcut_slider_steps", overrides)
 
 

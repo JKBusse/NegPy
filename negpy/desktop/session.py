@@ -779,7 +779,9 @@ class DesktopSessionManager(QObject):
             target_hash = self.state.uploaded_files[idx]["hash"]
             target_config = self.repo.load_file_settings(target_hash) or WorkspaceConfig()
             target_path = self.state.uploaded_files[idx]["path"]
-            self.repo.save_file_settings(target_hash, build_synced_config(source_config, target_config, aspects, src_bounds), file_path=target_path)
+            self.repo.save_file_settings(
+                target_hash, build_synced_config(source_config, target_config, aspects, src_bounds), file_path=target_path
+            )
             count += 1
 
         if count:

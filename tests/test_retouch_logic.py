@@ -31,9 +31,7 @@ def test_polyline_stroke_is_smoothed():
     """A >=3-waypoint scratch heals along a densified Catmull-Rom chain."""
     h, w = 120, 160
     pts = [[0.2, 0.2], [0.5, 0.35], [0.8, 0.2], [0.6, 0.6]]
-    reg_i, _reg_f, _pts = build_heal_regions(
-        [(pts, _size_at_ref(10.0, (h, w)), 0.1, 0.0)], [], (h, w), 0, 0.0, False, False, 0.0, (w, h)
-    )
+    reg_i, _reg_f, _pts = build_heal_regions([(pts, _size_at_ref(10.0, (h, w)), 0.1, 0.0)], [], (h, w), 0, 0.0, False, False, 0.0, (w, h))
     chain_len = int(reg_i[0][1])
     assert chain_len > len(pts), "polyline heal chain was not smoothed/densified"
 
@@ -42,9 +40,7 @@ def test_two_point_stroke_not_densified():
     """A straight 2-point stroke stays exactly 2 chain points (nothing to smooth)."""
     h, w = 120, 160
     pts = [[0.3, 0.3], [0.7, 0.6]]
-    reg_i, _reg_f, _pts = build_heal_regions(
-        [(pts, _size_at_ref(10.0, (h, w)), 0.1, 0.0)], [], (h, w), 0, 0.0, False, False, 0.0, (w, h)
-    )
+    reg_i, _reg_f, _pts = build_heal_regions([(pts, _size_at_ref(10.0, (h, w)), 0.1, 0.0)], [], (h, w), 0, 0.0, False, False, 0.0, (w, h))
     assert int(reg_i[0][1]) == 2
 
 
