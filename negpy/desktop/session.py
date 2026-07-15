@@ -53,6 +53,7 @@ class AppState:
     preview_raw: Optional[Any] = None
     preview_ir: Optional[Any] = None  # downsampled IR float32 [0,1] (H,W); None if source has no IR
     has_ir: bool = False
+    ir_degenerate: bool = False  # IR plane carries image content (B&W/Kodachrome) → IR restore disabled
     original_res: tuple[int, int] = (0, 0)
     clipboard: Optional[WorkspaceConfig] = None
 
@@ -86,6 +87,10 @@ class AppState:
     # Crop tool composition guide (CropGuide value); display-only, so not in GeometryConfig
     crop_guide: str = "thirds"
     crop_guide_orientation: int = 0
+
+    # Dust-detection overlay mode ("off"|"spots"|"marked"|"ir"); display-only,
+    # session-only diagnostic — never persisted.
+    dust_overlay_mode: str = "off"
 
     # Reverse scroll-wheel zoom direction on the image viewer (scroll up = zoom out).
     invert_zoom_scroll: bool = False
