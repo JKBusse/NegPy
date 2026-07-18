@@ -38,6 +38,9 @@ class SessionPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        self.header = SidebarHeader(self.controller)
+        layout.addWidget(self.header)
+
         self.update_label = QLabel("")
         self.update_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.update_label.setObjectName("update_label")
@@ -46,9 +49,6 @@ class SessionPanel(QWidget):
         self.update_label.setCursor(Qt.CursorShape.PointingHandCursor)
         self.update_label.setVisible(False)
         layout.addWidget(self.update_label)
-
-        self.header = SidebarHeader(self.controller)
-        layout.addWidget(self.header)
 
         self.update_worker = UpdateCheckWorker()
         self.update_worker.finished.connect(self._on_update_found)
