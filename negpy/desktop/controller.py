@@ -28,7 +28,7 @@ from negpy.desktop.workers.render import (
     ThumbnailUpdateTask,
     ThumbnailWorker,
 )
-from negpy.desktop.workers.scan_worker import ScanRequest, ScanWorker
+from negpy.desktop.workers.scan_worker import BatchRequest, RollPreviewRequest, ScanRequest, ScanWorker
 from negpy.desktop.workers.capture_worker import (
     CalibrationRequest,
     CaptureRequest,
@@ -201,6 +201,16 @@ class AppController(QObject):
     scan_finished = pyqtSignal(str)
     scan_error = pyqtSignal(str)
     scan_started = pyqtSignal()
+    scan_cancelled = pyqtSignal()
+    scan_ejected = pyqtSignal(bool)
+    scan_eject_error = pyqtSignal(str)
+    scan_frame_done = pyqtSignal(int, str)  # batch: frame number, rgb path
+    scan_batch_finished = pyqtSignal(list)  # batch: all completed rgb paths
+    scan_batch_requested = pyqtSignal(BatchRequest)
+    scan_eject_requested = pyqtSignal(str)
+    scan_roll_preview_requested = pyqtSignal(RollPreviewRequest)
+    scan_roll_preview_ready = pyqtSignal(object)  # one RollPreview per strip slot
+    scan_roll_preview_finished = pyqtSignal()
     capture_light_requested = pyqtSignal(int, int, int, int, str)
     capture_requested = pyqtSignal(CaptureRequest)
     capture_light_set = pyqtSignal(int, int, int, int)
@@ -471,6 +481,16 @@ class AppController(QObject):
         self.scan_worker.finished.connect(self._on_scan_finished)
         self.scan_worker.error.connect(self.scan_error.emit)
         self.scan_requested.connect(self.scan_worker.run_scan)
+        self.scan_batch_requested.connect(self.scan_worker.run_batch)
+        self.scan_eject_requested.connect(self.scan_worker.eject)
+        self.scan_worker.cancelled.connect(self.scan_cancelled.emit)
+        self.scan_worker.frame_done.connect(self.scan_frame_done.emit)
+        self.scan_worker.batch_finished.connect(self._on_scan_batch_finished)
+        self.scan_worker.ejected.connect(self.scan_ejected.emit)
+        self.scan_worker.eject_error.connect(self.scan_eject_error.emit)
+        self.scan_roll_preview_requested.connect(self.scan_worker.run_roll_preview)
+        self.scan_worker.roll_preview_ready.connect(self.scan_roll_preview_ready.emit)
+        self.scan_worker.roll_preview_finished.connect(self.scan_roll_preview_finished.emit)
         self.capture_light_requested.connect(self.capture_worker.set_light)
         self.capture_requested.connect(self.capture_worker.run_capture)
         self.capture_worker.light_set.connect(self.capture_light_set.emit)
@@ -2009,8 +2029,25 @@ class AppController(QObject):
 
     def start_scan(self, req: ScanRequest) -> None:
         """Start a scan. The UI connects to scan signals for state updates."""
+        self.scan_worker.prepare_scan()
         self.scan_started.emit()
         self.scan_requested.emit(req)
+
+    def start_batch(self, req: BatchRequest) -> None:
+        """Start a frame-range batch scan over a roll/strip feeder."""
+        self.scan_worker.prepare_scan()
+        self.scan_started.emit()
+        self.scan_batch_requested.emit(req)
+
+    def start_roll_preview(self, req: RollPreviewRequest) -> None:
+        """Preview strip slots (results via scan_roll_preview_ready, then
+        scan_roll_preview_finished). No scan_started — preview is dialog-local."""
+        self.scan_worker.prepare_scan()
+        self.scan_roll_preview_requested.emit(req)
+
+    def eject_scanner(self, device_id: str) -> None:
+        """Trigger the scanner's eject action on the worker thread."""
+        self.scan_eject_requested.emit(device_id)
 
     def cancel_scan(self) -> None:
         self.scan_worker.cancel()
@@ -2020,6 +2057,13 @@ class AppController(QObject):
         self.scan_finished.emit(path)
         self._pending_scanned_file = path
         self.request_asset_discovery([path])
+
+    def _on_scan_batch_finished(self, paths: list) -> None:
+        """Import every frame a batch completed, including a stopped or failed run."""
+        self.scan_batch_finished.emit(paths)
+        if paths:
+            self._pending_scanned_file = paths[-1]
+            self.request_asset_discovery(list(paths))
 
     def _select_file_by_path(self, path: str) -> bool:
         """Find a file by path in uploaded_files and select it."""

@@ -8,8 +8,6 @@
 - Change: **Update notice is now a link** — the "Update Available" banner under the logo is clickable and takes you straight to the GitHub releases page, with a download icon.
 
 
-
-
 ## 0.38.0
 
 - New: **Finish panel — edge burn, filed carrier and print mats** — a new Finish panel finishes the print after crop: **Edge Burn** replaces vignette with a true exposure burn in stops (radial or, via Roundness, a rectangular card-burn), **Filed Carrier** prints the black rebate of a filed-out negative carrier with a roughened inner edge, and **Border** adds a mat with adjustable width and colour, a bottom-weighted (window-mat) proportion, and a Match Paper White option that ties the mat colour to the toned paper white instead of a picked colour.
