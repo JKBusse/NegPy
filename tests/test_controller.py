@@ -4,13 +4,15 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 from dataclasses import replace
+from types import SimpleNamespace
 
 from PyQt6.QtWidgets import QApplication
 
 from negpy.desktop.controller import AppController
 from negpy.desktop.session import DesktopSessionManager, AppState, ToolMode
 from negpy.desktop.workers.export import ExportTask, resolve_export_target_path
-from negpy.domain.models import ExportConfig, ExportFormat, ExportPreset, ExportPresetOutputMode, WorkspaceConfig
+from negpy.domain.models import ColorSpace, ExportConfig, ExportFormat, ExportPreset, ExportPresetOutputMode, WorkspaceConfig
+from negpy.infrastructure.scanners.params import ScanParams
 from negpy.services.rendering.preview_manager import PreviewManager
 
 if not QApplication.instance():
@@ -133,6 +135,51 @@ class TestAppController(unittest.TestCase):
 
         cancelled.assert_called_once_with()
 
+    def test_scan_worker_cancelled_is_forwarded(self):
+        cancelled = MagicMock()
+        self.controller.scan_cancelled.connect(cancelled)
+
+        self.controller.scan_worker.cancelled.emit()
+
+        cancelled.assert_called_once_with()
+
+    def test_start_scan_prepares_worker_before_emitting_signals(self):
+        from negpy.desktop.workers.scan_worker import ScanRequest
+
+        events: list[object] = []
+        request = ScanRequest(
+            device_id="coolscan3:test",
+            params=ScanParams(dpi=4_000, depth=16, capture_ir=False),
+            output_folder="/tmp",
+            filename_pattern='scan-{{ "%03d" % seq }}',
+            output_format="TIFF",
+        )
+        controller = SimpleNamespace(
+            scan_worker=SimpleNamespace(prepare_scan=lambda: events.append("prepare")),
+            scan_started=SimpleNamespace(emit=lambda: events.append("started")),
+            scan_requested=SimpleNamespace(emit=lambda value: events.append(("request", value))),
+        )
+
+        AppController.start_scan(controller, request)
+
+        self.assertEqual(events, ["prepare", "started", ("request", request)])
+
+    def test_start_roll_preview_prepares_worker_and_emits_preview_only(self):
+        from negpy.desktop.workers.scan_worker import RollPreviewRequest
+
+        events: list[object] = []
+        request = RollPreviewRequest(device=SimpleNamespace(id="coolscan3:test"), slots=(1, 2), dpi=500)
+        controller = SimpleNamespace(
+            scan_worker=SimpleNamespace(prepare_scan=lambda: events.append("prepare")),
+            scan_started=SimpleNamespace(emit=lambda: events.append("started")),
+            scan_roll_preview_requested=SimpleNamespace(emit=lambda value: events.append(("preview", value))),
+        )
+
+        AppController.start_roll_preview(controller, request)
+
+        # No "started": a preview must not flip the main scan UI into scanning state.
+        self.assertEqual(events, ["prepare", ("preview", request)])
+
     def test_thumbnail_refreshes_on_config_changed_settle(self):
         """Filmstrip thumbnail is re-captured on every settled render whose config
         differs from the last capture (covers in-place edits and reset), but not on a
@@ -190,6 +237,35 @@ class TestAppController(unittest.TestCase):
         self.controller.state.soft_proof_enabled = True
         # An export color space resolves an effective output profile → proof active.
         self.assertTrue(self.controller.proof_active())
+
+    def test_effective_input_icc(self):
+        """Explicit Input ICC wins; Narrowband Scan supplies the bundled RGBScan
+        profile when none is set; None when both are off."""
+        state = self.controller.state
+        self.assertIsNone(self.controller.effective_input_icc())
+
+        state.config = replace(state.config, process=replace(state.config.process, narrowband_scan=True))
+        path = self.controller.effective_input_icc()
+        assert path is not None
+        self.assertTrue(path.endswith(os.path.join("icc", "RGBScan.icc")))
+        self.assertTrue(os.path.exists(path))
+
+        state.icc_input_path = "/custom.icc"
+        self.assertEqual(self.controller.effective_input_icc(), "/custom.icc")
+
+    def test_proof_active_with_narrowband_scan(self):
+        """Narrowband Scan forces proofing on even with the soft-proof toggle off."""
+        state = self.controller.state
+        state.soft_proof_enabled = False
+        self.assertFalse(self.controller.proof_active())
+        state.config = replace(state.config, process=replace(state.config.process, narrowband_scan=True))
+        self.assertTrue(self.controller.proof_active())
+
+    def test_narrowband_profile_hidden_from_dropdown(self):
+        from negpy.infrastructure.display.color_mgmt import ColorService
+
+        profiles = ColorService.get_available_profiles()
+        self.assertFalse(any(p.endswith("RGBScan.icc") for p in profiles))
 
     def test_load_file_preserve_zoom(self):
         """Test that load_file with preserve_zoom=True skips resetting zoom."""
@@ -271,6 +347,125 @@ class TestAppController(unittest.TestCase):
         self.assertFalse(saved_config.geometry.auto_crop_enabled)
         self.assertIsNone(saved_config.geometry.manual_crop_rect)
         self.controller.request_render.assert_called_once_with()
+
+    def test_set_crop_ratio_updates_config_when_no_manual_rect(self):
+        self.controller.request_render = MagicMock()
+
+        self.controller.set_crop_ratio("4:3")
+
+        saved_config = self.mock_session_manager.update_config.call_args.args[0]
+        self.assertEqual(saved_config.geometry.autocrop_ratio, "4:3")
+        self.assertIsNone(saved_config.geometry.manual_crop_rect)
+        self.controller.request_render.assert_called_once_with()
+
+    def test_set_crop_ratio_is_noop_when_unchanged(self):
+        geometry = replace(self.controller.state.config.geometry, autocrop_ratio="3:2")
+        self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
+        self.controller.request_render = MagicMock()
+
+        self.controller.set_crop_ratio("3:2")
+
+        self.mock_session_manager.update_config.assert_not_called()
+        self.controller.request_render.assert_not_called()
+
+    def test_set_crop_ratio_preserves_metering_bounds(self):
+        """A ratio change is a pure reframe and must not re-meter. Clearing the
+        per-file bounds makes the next render re-analyze over the new (smaller) ROI,
+        which lands on different per-channel floors/ceils — a visible colour cast
+        shift on the canvas from an operation that only changed the frame."""
+        import numpy as np
+
+        self.controller.state.preview_raw = np.empty((800, 1200, 3), dtype=np.float32)
+        floors, ceils = (-2.3, -2.4, -2.8), (-1.3, -1.2, -1.6)
+        config = replace(
+            self.controller.state.config, process=replace(self.controller.state.config.process, local_floors=floors, local_ceils=ceils)
+        )
+        config = replace(config, geometry=replace(config.geometry, manual_crop_rect=(0.15, 0.15, 0.85, 0.85)))
+        self.controller.state.config = config
+        self.controller.request_render = MagicMock()
+
+        self.controller.set_crop_ratio("4:3")
+
+        saved_config = self.mock_session_manager.update_config.call_args.args[0]
+        self.assertEqual(saved_config.process.local_floors, floors)
+        self.assertEqual(saved_config.process.local_ceils, ceils)
+        self.assertTrue(saved_config.process.is_local_initialized)
+
+    def test_set_crop_ratio_reshape_never_grows_the_box(self):
+        """The no-re-meter rule above is only safe because the reshape shrinks within
+        the existing footprint — a box that could grow might pull film rebate into the
+        metered region, which is exactly what the bounds invalidation elsewhere guards."""
+        import numpy as np
+
+        self.controller.state.preview_raw = np.empty((800, 1200, 3), dtype=np.float32)
+        rect = (0.15, 0.15, 0.85, 0.85)
+        self.controller.state.config = replace(
+            self.controller.state.config,
+            geometry=replace(self.controller.state.config.geometry, manual_crop_rect=rect),
+        )
+        self.controller.request_render = MagicMock()
+
+        for ratio in ("1:1", "4:3", "16:9", "65:24", "5:4"):
+            self.mock_session_manager.reset_mock()
+            self.controller.state.config = replace(
+                self.controller.state.config,
+                geometry=replace(self.controller.state.config.geometry, autocrop_ratio="Free", manual_crop_rect=rect),
+            )
+            self.controller.set_crop_ratio(ratio)
+            nx1, ny1, nx2, ny2 = self.mock_session_manager.update_config.call_args.args[0].geometry.manual_crop_rect
+            self.assertGreaterEqual(nx1, rect[0] - 1e-6, f"{ratio}: box grew left")
+            self.assertGreaterEqual(ny1, rect[1] - 1e-6, f"{ratio}: box grew up")
+            self.assertLessEqual(nx2, rect[2] + 1e-6, f"{ratio}: box grew right")
+            self.assertLessEqual(ny2, rect[3] + 1e-6, f"{ratio}: box grew down")
+
+    def test_set_crop_ratio_reshapes_manual_rect_centered_pixel_aware(self):
+        """Reshaping must use real pixel dimensions, not normalized fractions —
+        a non-square display image means "1:1" in normalized space isn't actually
+        square on screen, so the controller (which has the image shape) must do
+        this, not the sidebar."""
+        import numpy as np
+
+        self.controller.state.preview_raw = np.empty((800, 1200, 3), dtype=np.float32)  # h=800, w=1200
+        geometry = replace(self.controller.state.config.geometry, manual_crop_rect=(0.25, 0.25, 0.75, 0.75))
+        self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
+        self.controller.request_render = MagicMock()
+
+        self.controller.set_crop_ratio("1:1")
+
+        saved_config = self.mock_session_manager.update_config.call_args.args[0]
+        self.assertEqual(saved_config.geometry.autocrop_ratio, "1:1")
+        nx1, ny1, nx2, ny2 = saved_config.geometry.manual_crop_rect
+        # Center unchanged.
+        self.assertAlmostEqual((nx1 + nx2) / 2, 0.5, places=3)
+        self.assertAlmostEqual((ny1 + ny2) / 2, 0.5, places=3)
+        # True pixel square: (nx2-nx1)*1200 == (ny2-ny1)*800.
+        px_w = (nx2 - nx1) * 1200
+        px_h = (ny2 - ny1) * 800
+        self.assertAlmostEqual(px_w, px_h, delta=1.0)
+        self.controller.request_render.assert_called_once_with()
+
+    def test_set_crop_ratio_accounts_for_90_degree_rotation(self):
+        import numpy as np
+
+        # Source is landscape (h=800, w=1200); a 90 rotation makes the display
+        # portrait (h=1200, w=800) — the reshape must use the rotated dims.
+        self.controller.state.preview_raw = np.empty((800, 1200, 3), dtype=np.float32)
+        geometry = replace(
+            self.controller.state.config.geometry,
+            rotation=1,
+            manual_crop_rect=(0.25, 0.25, 0.75, 0.75),
+        )
+        self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
+        self.controller.request_render = MagicMock()
+
+        self.controller.set_crop_ratio("1:1")
+
+        saved_config = self.mock_session_manager.update_config.call_args.args[0]
+        nx1, ny1, nx2, ny2 = saved_config.geometry.manual_crop_rect
+        # Display dims after a 90 rotation: h=1200, w=800.
+        px_w = (nx2 - nx1) * 800
+        px_h = (ny2 - ny1) * 1200
+        self.assertAlmostEqual(px_w, px_h, delta=1.0)
 
     def _export_task(self, path, overwrite=False):
         preset = ExportPreset(
@@ -455,6 +650,8 @@ class TestAppController(unittest.TestCase):
             PolygonMask(vertices=verts, strength=-0.3, feather=0.02),
         )
         self.controller.state.config = replace(self.controller.state.config, local=LocalAdjustmentsConfig(masks=masks))
+        # Hidden-mask state is keyed by the open file's hash; give the tests one.
+        self.controller.state.current_file_hash = "hashA"
 
     def test_set_local_mask_visible_toggles_hidden_set(self):
         self._seed_two_masks()
@@ -462,6 +659,43 @@ class TestAppController(unittest.TestCase):
         self.controller.set_local_mask_visible(1, False)
         self.assertEqual(self.controller.state.local_hidden_masks, {1})
         self.controller.set_local_mask_visible(1, True)
+        self.assertEqual(self.controller.state.local_hidden_masks, set())
+
+    def test_hidden_masks_persist_per_file_hash(self):
+        self._seed_two_masks()
+        self.controller.canvas = None
+        self.controller.state.current_file_hash = "hashA"
+        self.controller.set_local_mask_visible(1, False)
+        self.assertEqual(self.controller.state.local_hidden_masks_by_hash["hashA"], {1})
+
+        # Simulate switching away: another file's set is independent.
+        self.controller.state.current_file_hash = "hashB"
+        self.controller.state.local_hidden_masks = set()
+        self.controller.set_local_mask_visible(0, False)
+        self.assertEqual(self.controller.state.local_hidden_masks_by_hash["hashB"], {0})
+        self.assertEqual(self.controller.state.local_hidden_masks_by_hash["hashA"], {1})
+
+    def test_hidden_masks_cleared_hash_is_pruned(self):
+        self._seed_two_masks()
+        self.controller.canvas = None
+        self.controller.state.current_file_hash = "hashA"
+        self.controller.set_local_mask_visible(1, False)
+        self.controller.set_local_mask_visible(1, True)
+        self.assertNotIn("hashA", self.controller.state.local_hidden_masks_by_hash)
+
+    def test_hidden_masks_clamped_when_mask_count_shrinks(self):
+        from negpy.features.local.models import LocalAdjustmentsConfig, PolygonMask
+
+        self._seed_two_masks()  # 2 masks under hashA
+        self.controller.canvas = None
+        self.controller.set_local_mask_visible(1, False)
+        self.assertEqual(self.controller.state.local_hidden_masks, {1})
+
+        # Simulate an undo/redo/jump that swaps in a config with fewer masks: the stored
+        # index 1 now points past the end and must be dropped from the returned set.
+        verts = ((0.1, 0.1), (0.9, 0.1), (0.5, 0.9))
+        one_mask = (PolygonMask(vertices=verts, strength=0.3, feather=0.02),)
+        self.controller.state.config = replace(self.controller.state.config, local=LocalAdjustmentsConfig(masks=one_mask))
         self.assertEqual(self.controller.state.local_hidden_masks, set())
 
     def test_delete_local_mask_confirmed_remaps_view_indices(self):
@@ -589,29 +823,46 @@ class TestBatchExportFiltering(unittest.TestCase):
             self.assertEqual(t.params.export.export_path, "/tmp/out")
 
     def test_export_all_saved_overrides_path_with_session_values(self):
-        """all_saved scope uses session path/mode even when per-file configs are stale."""
+        """all_saved scope uses session path/mode/format even when per-file configs are stale."""
         self.visible_indices = [0, 1]
         session_export = self.controller.state.config.export
+        # Per-file config has stale SAME_AS_SOURCE (differs from session default
+        # ABSOLUTE) + stale DNG + stale AdobeRGB + stale jpeg_quality — delivery
+        # overrides (mode, fmt, color_space) must use session; sizing (quality) is
+        # preserved from per-file.
         stale_export = replace(
             session_export,
-            output_mode=ExportPresetOutputMode.ABSOLUTE,
+            output_mode=ExportPresetOutputMode.SAME_AS_SOURCE,
             export_path="/stale/default",
             output_subfolder="old_sub",
+            export_fmt=ExportFormat.DNG,
+            export_color_space=ColorSpace.ADOBE_RGB.value,
+            jpeg_quality=50,
         )
         stale_config = replace(self.controller.state.config, export=stale_export)
-        # Per-file config has stale ABSOLUTE; session has SAME_AS_SOURCE
         self.mock_session_manager.repo.load_file_settings.return_value = stale_config
         self.controller.request_batch_export(override_settings=False)
         tasks = self._captured_tasks()
         self.assertEqual(len(tasks), 2)
         for t in tasks:
-            # output_mode and output_subfolder come from session config
+            # output_mode is overridden from session (ABSOLUTE), NOT stale (SAME_AS_SOURCE)
             self.assertEqual(t.params.export.output_mode, session_export.output_mode)
+            self.assertNotEqual(t.params.export.output_mode, ExportPresetOutputMode.SAME_AS_SOURCE)
             self.assertEqual(t.params.export.output_subfolder, session_export.output_subfolder)
             # export_path is validated by _ensure_valid_export_path (mocked to /tmp/out)
             self.assertEqual(t.params.export.export_path, "/tmp/out")
-            # Format/quality from per-file config is preserved
-            self.assertEqual(t.params.export.export_fmt, stale_export.export_fmt)
+            # Format/color-space from session config overrides per-file values so
+            # the delivery format matches what the UI shows, not a stale per-file setting.
+            # Without the fix, stale_export.export_fmt=DNG would leak into the export.
+            self.assertEqual(t.params.export.export_fmt, session_export.export_fmt)
+            self.assertNotEqual(t.params.export.export_fmt, ExportFormat.DNG)
+            self.assertEqual(t.params.export.export_color_space, session_export.export_color_space)
+            self.assertNotEqual(t.params.export.export_color_space, ColorSpace.ADOBE_RGB.value)
+            # Quality/sizing from per-file config is preserved
+            self.assertEqual(t.params.export.jpeg_quality, stale_export.jpeg_quality)
+            # Verify export_settings (the delivery config the worker actually reads)
+            self.assertEqual(t.export_settings.export_fmt, session_export.export_fmt)
+            self.assertEqual(t.export_settings.export_color_space, session_export.export_color_space)
 
 
 class TestPresetBatchExport(unittest.TestCase):
@@ -929,8 +1180,28 @@ class TestRgbScanModeReload(unittest.TestCase):
 
     def test_toggle_with_no_files_only_saves_flag(self):
         self.controller.set_rgb_scan_mode(True)
-        self.mock_session_manager.repo.save_global_setting.assert_called_once_with("rgbscan_mode", True)
+        self.mock_session_manager.repo.save_global_setting.assert_any_call("rgbscan_mode", True)
         self.controller.request_asset_discovery.assert_not_called()
+
+    def test_enabling_sets_sticky_narrowband_default(self):
+        self.controller.set_rgb_scan_mode(True)
+        self.mock_session_manager.repo.save_global_setting.assert_any_call("last_narrowband_scan", True)
+
+    def test_disabling_does_not_touch_narrowband(self):
+        self.controller.set_rgb_scan_mode(False)
+        calls = [c.args for c in self.mock_session_manager.repo.save_global_setting.call_args_list]
+        self.assertNotIn(("last_narrowband_scan", True), calls)
+
+    def test_enabling_forces_narrowband_on_active_config(self):
+        state = self.mock_session_manager.state
+        state.uploaded_files = [{"name": "a", "path": "/a.dng", "hash": "h1"}]
+        state.current_file_path = "/a.dng"
+        self.assertFalse(state.config.process.narrowband_scan)
+
+        self.controller.set_rgb_scan_mode(True)
+
+        updated_config = self.mock_session_manager.update_config.call_args.args[0]
+        self.assertTrue(updated_config.process.narrowband_scan)
 
     def test_toggle_with_loaded_files_rediscovers_all_exposures(self):
         state = self.mock_session_manager.state
@@ -1321,3 +1592,90 @@ class TestRetouchPersistence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDisplayTransformParams(unittest.TestCase):
+    """The canvas and the filmstrip thumbnail must derive their display transform
+    from the same place. When a soft proof is active the render worker has already
+    baked source->output->monitor into the buffer, so the transform has to be a
+    no-op; treating that buffer as working-space re-applies ProPhoto->sRGB and the
+    thumbnail comes out visibly oversaturated next to the canvas."""
+
+    def setUp(self):
+        self.mock_session_manager = MagicMock(spec=DesktopSessionManager)
+        self.mock_session_manager.state = AppState()
+        self.mock_session_manager.repo = MagicMock()
+        with (
+            patch("negpy.desktop.controller.RenderWorker") as mock_rw_class,
+            patch("negpy.desktop.controller.PreviewManager") as mock_pm_class,
+        ):
+            mock_rw_class.return_value = MagicMock()
+            mock_pm_class.return_value = MagicMock(spec=PreviewManager)
+            mock_pm_class.return_value.load_linear_preview.return_value = (None, (0, 0), {})
+            self.controller = AppController(self.mock_session_manager)
+        self.controller.state.monitor_icc_bytes = b"fake-monitor-profile"
+
+    def tearDown(self):
+        import gc
+
+        # Same teardown as TestAppController: the controller owns live QThreads and
+        # letting it be collected while they run crashes the interpreter.
+        for thread in [
+            self.controller.render_thread,
+            self.controller.export_thread,
+            self.controller.thumb_thread,
+            self.controller.norm_thread,
+            self.controller.discovery_thread,
+            self.controller.preview_load_thread,
+            self.controller.scan_thread,
+        ]:
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                thread.wait()
+        del self.controller
+        gc.collect()
+
+    def test_proof_active_yields_a_no_op_transform(self):
+        self.controller.proof_active = lambda: True
+        cs, monitor = self.controller.display_transform_params()
+        # sRGB source + no monitor profile is the documented identity case in
+        # get_display_lut, i.e. the already-baked buffer is passed through untouched.
+        self.assertEqual(cs, ColorSpace.SRGB.value)
+        self.assertIsNone(monitor)
+
+    def test_proof_inactive_converts_from_the_working_space(self):
+        self.controller.proof_active = lambda: False
+        cs, monitor = self.controller.display_transform_params()
+        self.assertEqual(cs, self.controller.state.workspace_color_space)
+        self.assertEqual(monitor, b"fake-monitor-profile")
+
+    def test_splash_buffer_is_treated_as_srgb(self):
+        self.controller.proof_active = lambda: False
+        cs, monitor = self.controller.display_transform_params(splash=True)
+        self.assertEqual(cs, ColorSpace.SRGB.value)
+        self.assertEqual(monitor, b"fake-monitor-profile")
+
+    def test_thumbnail_task_carries_the_same_params_as_the_canvas(self):
+        """The actual regression: the thumbnail used to hardcode the working space."""
+        import numpy as np
+
+        self.controller.proof_active = lambda: True
+        state = self.controller.state
+        state.current_file_path = "/tmp/frame.cr2"
+        state.current_file_hash = "hash-1"
+        state.last_metrics = {"base_positive": np.zeros((4, 4, 3), dtype=np.float32)}
+
+        emitted = []
+        # Drop the real worker connection first: emitting would otherwise hand the
+        # buffer to the thumbnail QThread, which then races this test's teardown.
+        try:
+            self.controller.thumbnail_update_requested.disconnect()
+        except TypeError:
+            pass
+        self.controller.thumbnail_update_requested.connect(emitted.append)
+        self.controller._update_thumbnail_from_state()
+
+        self.assertEqual(len(emitted), 1)
+        task = emitted[0]
+        self.assertEqual((task.color_space, task.monitor_icc_bytes), self.controller.display_transform_params())
+        self.assertNotEqual(task.color_space, state.workspace_color_space)

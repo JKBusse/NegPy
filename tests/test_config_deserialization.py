@@ -23,6 +23,11 @@ class TestConfigDeserialization(unittest.TestCase):
         self.assertEqual(config.exposure.grade, 90.0)
         self.assertEqual(config.export.export_fmt, "TIFF")
 
+    def test_narrowband_scan_round_trip(self):
+        self.assertFalse(WorkspaceConfig().to_dict()["narrowband_scan"])
+        config = WorkspaceConfig.from_flat_dict({"narrowband_scan": True})
+        self.assertTrue(config.process.narrowband_scan)
+
     def test_unknown_keys_warning(self):
         data = {
             "process_mode": ProcessMode.BW,
@@ -44,7 +49,7 @@ class TestConfigDeserialization(unittest.TestCase):
         with self.assertNoLogs("negpy.domain.models", level=logging.WARNING):
             WorkspaceConfig.from_flat_dict(data)
 
-    def test_crossover_true_black_roundtrip(self):
+    def test_crossover_paper_black_roundtrip(self):
         config = WorkspaceConfig()
         config = replace(
             config,
@@ -68,7 +73,7 @@ class TestConfigDeserialization(unittest.TestCase):
                 shoulder_trim_red=-0.5,
                 shoulder_trim_green=0.2,
                 shoulder_trim_blue=0.05,
-                true_black=True,
+                paper_black=True,
                 midtone_gamma=-0.2,
                 midtone_gamma_trim_red=0.15,
                 midtone_gamma_trim_green=-0.25,
@@ -101,7 +106,7 @@ class TestConfigDeserialization(unittest.TestCase):
         self.assertEqual(reloaded.exposure.shoulder_trim_red, -0.5)
         self.assertEqual(reloaded.exposure.shoulder_trim_green, 0.2)
         self.assertEqual(reloaded.exposure.shoulder_trim_blue, 0.05)
-        self.assertTrue(reloaded.exposure.true_black)
+        self.assertTrue(reloaded.exposure.paper_black)
         self.assertEqual(reloaded.exposure.midtone_gamma, -0.2)
         self.assertEqual(reloaded.exposure.midtone_gamma_trim_red, 0.15)
         self.assertEqual(reloaded.exposure.midtone_gamma_trim_green, -0.25)
@@ -128,6 +133,14 @@ class TestConfigDeserialization(unittest.TestCase):
         self.assertEqual(reloaded.process.black_point_trim_red, -0.03)
         self.assertEqual(reloaded.process.black_point_trim_green, 0.07)
         self.assertEqual(reloaded.process.black_point_trim_blue, 0.11)
+
+    def test_legacy_true_black_migrates_inverted(self):
+        # True Black renamed to Paper Black with inverted polarity: a saved edit's
+        # rendered look must survive the rename.
+        off = WorkspaceConfig.from_flat_dict({"true_black": False})
+        self.assertTrue(off.exposure.paper_black)
+        on = WorkspaceConfig.from_flat_dict({"true_black": True})
+        self.assertFalse(on.exposure.paper_black)
 
     def test_use_original_res_true_migrates_to_original_mode(self):
         data = {"use_original_res": True, "export_print_size": 30.0}
@@ -226,6 +239,33 @@ class TestConfigDeserialization(unittest.TestCase):
         self.assertIsInstance(reloaded.process.analysis_rect, tuple)
         self.assertEqual(reloaded.process.analysis_rect, (0.1, 0.2, 0.8, 0.9))
         hash(reloaded.process)  # must not raise
+
+    def test_legacy_vignette_strength_migrates_to_stops(self):
+        config = WorkspaceConfig.from_flat_dict({"vignette_strength": -0.5})
+        self.assertAlmostEqual(config.finish.vignette_stops, 1.0)
+
+    def test_legacy_vignette_strength_dropped_when_stops_present(self):
+        config = WorkspaceConfig.from_flat_dict({"vignette_strength": -0.5, "vignette_stops": 0.3})
+        self.assertAlmostEqual(config.finish.vignette_stops, 0.3)
+
+    def test_legacy_vignette_strength_does_not_warn(self):
+        with self.assertNoLogs("negpy.domain.models", level=logging.WARNING):
+            WorkspaceConfig.from_flat_dict({"vignette_strength": 0.2})
+
+    def test_legacy_carrier_enabled_false_zeros_width(self):
+        # Pre-#542 saves always serialize both keys together; the old default
+        # width (2.0) must not read as "on" under the new width>0 gating just
+        # because the separate enabled toggle is gone.
+        config = WorkspaceConfig.from_flat_dict({"carrier_enabled": False, "carrier_width": 2.0})
+        self.assertEqual(config.finish.carrier_width, 0.0)
+
+    def test_legacy_carrier_enabled_true_keeps_width(self):
+        config = WorkspaceConfig.from_flat_dict({"carrier_enabled": True, "carrier_width": 3.0})
+        self.assertEqual(config.finish.carrier_width, 3.0)
+
+    def test_legacy_carrier_enabled_does_not_warn(self):
+        with self.assertNoLogs("negpy.domain.models", level=logging.WARNING):
+            WorkspaceConfig.from_flat_dict({"carrier_enabled": False, "carrier_width": 2.0})
 
     def test_autocrop_mode_defaults_to_image_for_legacy_dicts(self):
         config = WorkspaceConfig.from_flat_dict({"process_mode": ProcessMode.C41})

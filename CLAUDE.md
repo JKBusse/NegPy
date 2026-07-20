@@ -2,7 +2,7 @@
 
 Guidance for Claude Code in this repository.
 
-> **Keep this file current.** When a change alters something documented here — stage order, the feature pattern, commands, an invariant — update it in the same change.
+> **Keep this file current.** When a change alters something documented here — stage order, the feature pattern, commands — update it in the same change.
 
 ## Commands
 
@@ -32,10 +32,10 @@ Edits persist in SQLite (`edits.db`, keyed by content hash), optionally mirrored
 
 ### Pipeline
 
-- **CPU**: `DarkroomEngine.process()` (`negpy/services/rendering/engine.py`) — base (geometry + normalization) → exposure (incl. dodge/burn) → retouch → lab → toning → crop → finish. The first four stages are cached per config-hash via `_run_stage()`; the rest run unconditionally.
+- **CPU**: `DarkroomEngine.process()` (`negpy/services/rendering/engine.py`) — base (geometry + normalization) → exposure (incl. dodge/burn) → clahe → retouch → lab → toning → crop → finish. The first five stages are cached per config-hash via `_run_stage()`; the rest run unconditionally.
 - **GPU**: `GPUEngine` (`negpy/services/rendering/gpu_engine.py`) — same logical stages as WGSL compute shaders from `negpy/features/<name>/shaders/`, with its own config-diff change detection.
 - **Orchestration**: `ImageProcessor` (`image_processor.py`) tries GPU first, falls back to CPU; export always runs full-res. `PipelineContext` carries `scale_factor`, `process_mode`, `active_roi`, and a `metrics` dict between stages.
-- **Working space**: scene-linear internally; the working OETF (ProPhoto ROMM TRC) is applied only as the final engine step. Lab/toning compute CIELAB directly from linear.
+- **Working space**: scene-linear internally; the working OETF (Adobe RGB 1998 TRC — a pure 563/256 power, no linear segment) is applied only as the final engine step. Lab/toning compute CIELAB directly from linear, D65. Adobe RGB rather than a wide gamut because ProPhoto's imaginary primaries inflate chroma in the saturation/toning stages.
 
 `docs/PIPELINE.md` describes each stage's behaviour and controls in depth.
 
@@ -64,16 +64,11 @@ Every feature lives in `negpy/features/<name>/`:
 5. Add a sidebar and register it in `ControlsPanel`
 6. Add unit tests; if the feature has both CPU and GPU paths, add a parity test (pattern: `test_gpu_curve_parity.py`)
 
+## Style
+
+- **Comments minimal.** Comment only non-obvious constraints the code can't express (a cache contract, an ordering requirement, a rejected-alternative trap). No comments that narrate what the next line does, restate the diff, or justify a change to a reviewer. Prefer one dense line over a paragraph; docstrings short and factual.
+
 ## Invariants & gotchas
 
 - **CPU/GPU parity**: any change to a stage's math must land in both `logic.py` and its `.wgsl` shader. Constants mirrored as WGSL literals (histogram bins, zone density, metrics offsets) have parity tests — keep them in sync.
-- **Print H&D curve** has four lock-step mirrors: the numba kernel (`exposure/logic.py`), the `CharacteristicCurve` chart, `exposure.wgsl`, and the uniform pack in `gpu_engine.py`. Change all together; growing a GPU uniform struct is a `_uniform_sizes` bump + pack/WGSL row.
-- **Numba kernels**: decorate with `parallel_njit` (`kernel/system/parallel.py`), never raw `@njit(parallel=True)`. Per-row scratch arrays go inside the `prange` loop (thread-local); never pass `cache=True` (see `test_parallel_dispatch.py` for why).
-- **Working TRC** changes touch six sites: CPU `working_oetf_*` (`kernel/image/logic.py`), WGSL `oetf_*` in the exposure / output_encode / lab / metrics shaders, and `charts.py`. Primaries/white-point changes additionally touch the CPU XYZ matrices and the inline matrices in `lab.wgsl`/`toning.wgsl`.
-- **Coordinate spaces**: manual crop rect and analysis rect are normalized to the *transformed* (display) image; retouch strokes and dodge/burn placements are *source*-normalized and round-trip through `create_uv_grid`/`map_coords_to_geometry` — which must stay consistent with the image warp (incl. distortion k1).
-- **Metrics buffer** (`_METRICS_*` offsets, `gpu_engine.py`) is append-only; offsets are mirrored as WGSL array lengths.
-- **Camera capture** (`infrastructure/capture/gphoto.py`) has load-bearing libgphoto2 guards (a NULL-choice read SIGSEGVs the process; writes are async; the event queue must be drained after a still). Read that module before touching it.
-
-## More detail
-
-`docs/PIPELINE.md` (stage-by-stage behaviour), `docs/CAMERA_SCANNING.md`, `docs/CONTACT_SHEET_TEMPLATES.md`, `docs/CROSSTALK.md`. Deep design rationale for past decisions lives in git history (`git log -p CLAUDE.md`).
+- **Working-space OETF + luminance row are inlined** in `lab_sharpen_h.wgsl` and `rl_init.wgsl` (Adobe RGB 1998 gamma 563/256, D65 Y row) — a TRC or primaries change must update them, not just `kernel/image/logic.py`. `LabUniforms` is declared in 7 lab shaders (lab, lab_sharpen_h/v, rl_init/blur_h/div_v/mult_v) — any field change touches all.

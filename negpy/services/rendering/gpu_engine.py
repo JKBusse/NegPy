@@ -10,6 +10,9 @@ import wgpu  # type: ignore
 
 from negpy.domain.models import AspectRatio, ExportResolutionMode, WorkspaceConfig
 from negpy.features.exposure.analysis import DENSITY_HIST_BINS
+from negpy.features.finish.logic import carrier_profiles
+from negpy.features.finish.processor import carrier_width_px
+from negpy.features.exposure import models as exposure_models
 from negpy.features.exposure.normalization import (
     LogNegativeBounds,
     analyze_log_exposure_bounds_from_log,
@@ -35,6 +38,8 @@ from negpy.features.geometry.logic import (
     get_autocrop_coords,
     get_manual_rect_coords,
 )
+from negpy.features.lab.logic import gaussian_kernel_1d, rl_iterations
+from negpy.features.lab.models import SharpenMethod
 from negpy.features.local.logic import compute_local_ev_map
 from negpy.features.process.models import ProcessMode, per_channel_point_offsets
 from negpy.features.retouch.logic import build_heal_regions
@@ -137,6 +142,7 @@ def _analysis_cache_key(settings: WorkspaceConfig, analysis_source_hash: str) ->
         e.cast_removal_strength > 0.0,
         e.auto_exposure,
         e.auto_normalize_contrast,
+        exposure_models.TARGETS_REVISION,
     )
 
 
@@ -188,6 +194,12 @@ class GPUEngine:
             "clahe_cdf": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_cdf.wgsl")),
             "clahe_apply": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_apply.wgsl")),
             "retouch": get_resource_path(os.path.join("negpy", "features", "retouch", "shaders", "retouch.wgsl")),
+            "lab_sharpen_h": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab_sharpen_h.wgsl")),
+            "lab_sharpen_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab_sharpen_v.wgsl")),
+            "rl_init": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_init.wgsl")),
+            "rl_blur_h": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_blur_h.wgsl")),
+            "rl_div_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_div_v.wgsl")),
+            "rl_mult_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_mult_v.wgsl")),
             "lab": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab.wgsl")),
             "toning": get_resource_path(os.path.join("negpy", "features", "toning", "shaders", "toning.wgsl")),
             "finish": get_resource_path(os.path.join("negpy", "features", "finish", "shaders", "finish.wgsl")),
@@ -222,7 +234,7 @@ class GPUEngine:
             "retouch_u": 16,
             "lab": 96,
             "toning": 64,
-            "finish": 32,
+            "finish": 36,
             "layout": 48,
             "density_hist": 16,
         }
@@ -236,11 +248,14 @@ class GPUEngine:
         # (analysis_key, per-channel clipped fractions) for the scan-exposure warning.
         self._clip_cache: Optional[tuple] = None
         self._last_settings: Optional[WorkspaceConfig] = None
+        self._last_targets_rev: int = -1
         self._last_scale_factor: float = 1.0
         self._retouch_num_regions = 0
         # Region build+upload cache — retouch re-dispatches on every exposure
         # frame, and rebuilds aren't free at hundreds of synthesized regions.
         self._retouch_regions_key: Optional[tuple] = None
+        # (radius, scale_factor) of the sharpen taps currently in sharpen_k.
+        self._sharpen_kernel_key: Optional[tuple] = None
 
         # Bind groups reference resources, not contents, so they survive across frames;
         # cache and reuse (cleared in cleanup()). Saves ~28 wgpu calls per frame.
@@ -283,6 +298,10 @@ class GPUEngine:
             return 0
         if last.process != settings.process or last.exposure != settings.exposure:
             return 1
+        # Retuned Auto Density/Grade targets live in EXPOSURE_CONSTANTS, invisible to
+        # the config diff, but they reshape the print curve in the exposure pass.
+        if self._last_targets_rev != exposure_models.TARGETS_REVISION:
+            return 1
         if last.local != settings.local:
             return 1
         if last.lab.clahe_strength != settings.lab.clahe_strength:
@@ -296,6 +315,9 @@ class GPUEngine:
         if last.finish != settings.finish:
             return 7
         if last.export != settings.export:
+            # Carrier width is mm-of-print, so a print-size change moves the finish pass too.
+            if settings.finish.carrier_width > 0.0 and last.export.export_print_size != settings.export.export_print_size:
+                return 7
             return 8
 
         return 9  # Nothing changed
@@ -320,8 +342,9 @@ class GPUEngine:
         """Initializes hardware pipelines and persistent buffers."""
         if self._pipelines or not self.gpu.device:
             return
-        # Buffers are recreated below — force the next region upload.
+        # Buffers are recreated below — force the next region/kernel upload.
         self._retouch_regions_key = None
+        self._sharpen_kernel_key = None
         t0 = time.perf_counter()
         device = self.gpu.device
         self._sampler = device.create_sampler(min_filter="linear", mag_filter="linear")
@@ -344,9 +367,14 @@ class GPUEngine:
             65536,
             wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
         )
+        # Sharpen blur taps (gaussian_kernel_1d): 1024 f32 covers radius ≤ 511.
+        self._buffers["sharpen_k"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
         # 512 heal regions × 32 B, and 32K polyline/boundary points × 8 B.
         self._buffers["retouch_s"] = GPUBuffer(16384, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
         self._buffers["retouch_p"] = GPUBuffer(262144, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        # Filed-carrier jitter profiles are a fixed table — upload once.
+        self._buffers["carrier_s"] = GPUBuffer(4 * 512 * 4, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        self._buffers["carrier_s"].upload(np.ascontiguousarray(carrier_profiles().ravel(), dtype=np.float32))
         self._buffers["metrics"] = GPUBuffer(
             METRICS_BUFFER_SIZE,
             wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
@@ -602,7 +630,7 @@ class GPUEngine:
                 needs_textural,
             )
 
-        pw, ph, cw, ch, ox, oy = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
+        pw, ph, cw, ch, ox, oy, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
 
         # Regions before uniforms: the uniform block reads the uploaded region count.
         self._update_retouch_storage(
@@ -801,13 +829,60 @@ class GPUEngine:
             )
 
         if start_stage <= 4:
+            # Sharpen state (USM blur, or RL deconvolution) feeds the lab pass; a
+            # 1x1 dummy keeps binding 3 valid when sharpening is off.
+            usage = wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING
+            lab_u = self._get_uniform_binding("lab")
+            if settings.lab.sharpen > 0 and settings.lab.sharpen_method == SharpenMethod.RL:
+                # Iterative RL: ping-pong two textures through init + N × (blur_h,
+                # div_v, blur_h, mult_v). Final estimate lands back in rl_a.
+                tex_rl_a = self._get_intermediate_texture(w_rot, h_rot, usage, "rl_a")
+                tex_rl_b = self._get_intermediate_texture(w_rot, h_rot, usage, "rl_b")
+                self._dispatch_pass(enc, "rl_init", [(0, tex_ret.view), (1, tex_rl_a.view)], w_rot, h_rot)
+                sk = self._buffers["sharpen_k"]
+                for _ in range(rl_iterations(settings.lab.sharpen_radius)):
+                    self._dispatch_pass(enc, "rl_blur_h", [(0, tex_rl_a.view), (1, tex_rl_b.view), (2, lab_u), (3, sk)], w_rot, h_rot)
+                    self._dispatch_pass(enc, "rl_div_v", [(0, tex_rl_b.view), (1, tex_rl_a.view), (2, lab_u), (3, sk)], w_rot, h_rot)
+                    self._dispatch_pass(enc, "rl_blur_h", [(0, tex_rl_a.view), (1, tex_rl_b.view), (2, lab_u), (3, sk)], w_rot, h_rot)
+                    self._dispatch_pass(enc, "rl_mult_v", [(0, tex_rl_b.view), (1, tex_rl_a.view), (2, lab_u), (3, sk)], w_rot, h_rot)
+                tex_sharpen_v = tex_rl_a
+            elif settings.lab.sharpen > 0:
+                tex_sharpen_h = self._get_intermediate_texture(w_rot, h_rot, usage, "sharpen_h")
+                tex_sharpen_v = self._get_intermediate_texture(w_rot, h_rot, usage, "sharpen_v")
+                self._dispatch_pass(
+                    enc,
+                    "lab_sharpen_h",
+                    [
+                        (0, tex_ret.view),
+                        (1, tex_sharpen_h.view),
+                        (2, lab_u),
+                        (3, self._buffers["sharpen_k"]),
+                    ],
+                    w_rot,
+                    h_rot,
+                )
+                self._dispatch_pass(
+                    enc,
+                    "lab_sharpen_v",
+                    [
+                        (0, tex_sharpen_h.view),
+                        (1, tex_sharpen_v.view),
+                        (2, lab_u),
+                        (3, self._buffers["sharpen_k"]),
+                    ],
+                    w_rot,
+                    h_rot,
+                )
+            else:
+                tex_sharpen_v = self._get_intermediate_texture(1, 1, usage, "sharpen_v")
             self._dispatch_pass(
                 enc,
                 "lab",
                 [
                     (0, tex_ret.view),
                     (1, tex_lab.view),
-                    (2, self._get_uniform_binding("lab")),
+                    (2, lab_u),
+                    (3, tex_sharpen_v.view),
                 ],
                 w_rot,
                 h_rot,
@@ -843,6 +918,7 @@ class GPUEngine:
                     (0, tex_toning.view),
                     (1, tex_finish.view),
                     (2, self._get_uniform_binding("finish")),
+                    (3, self._buffers["carrier_s"]),
                 ],
                 crop_w,
                 crop_h,
@@ -852,7 +928,7 @@ class GPUEngine:
             tex_for_layout = tex_toning
 
         if not tiling_mode and apply_layout:
-            paper_w, paper_h, content_w, content_h, off_x, off_y = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
+            paper_w, paper_h, content_w, content_h, off_x, off_y, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
             tex_final = self._get_intermediate_texture(
                 paper_w,
                 paper_h,
@@ -973,6 +1049,7 @@ class GPUEngine:
                 logger.error(f"GPU Engine metrics error: {e}")
 
         self._last_settings = settings
+        self._last_targets_rev = exposure_models.TARGETS_REVISION
         self._last_scale_factor = scale_factor
         return tex_final, metrics
 
@@ -1051,6 +1128,7 @@ class GPUEngine:
             _reference_linear_value,
             effective_cast_strength,
             filtration_offsets,
+            grade_chroma_damping,
             per_channel_toe_shoulder,
             grade_coupled_shape,
             local_ev_scale,
@@ -1193,7 +1271,7 @@ class GPUEngine:
                 # vec4 w-lanes, widths the ex-scalar slots, Zone Density ΔD the
                 # ex-d_min slot + d_min_rgb.w, Split Grade the split_sh/split_hi
                 # rows past 256B (exposure spans two UBO slots).
-                1.0 if exp.true_black else 0.0,
+                1.0 if not exp.paper_black else 0.0,
             )
             + struct.pack("ffff", dmin_rgb[0], dmin_rgb[1], dmin_rgb[2], exp.highlight_density)
             # Dye-row w-lanes carry the per-channel midtone gamma (Snap).
@@ -1212,7 +1290,7 @@ class GPUEngine:
             struct.pack(
                 "ffiiii",
                 cls,
-                max(1.0, cls * 2.5),
+                cls * 2.5,
                 offset[0],
                 offset[1],
                 full_dims[0],
@@ -1230,20 +1308,34 @@ class GPUEngine:
         )
 
         lab = settings.lab
+        # Sharpen taps are computed once in Python (gaussian_kernel_1d — the same
+        # array the CPU convolves with) and uploaded to sharpen_k; the shaders only
+        # need the half-width. Derived from the array itself so support matches.
+        sharpen_radius_px = 0
+        if lab.sharpen > 0:
+            kernel = gaussian_kernel_1d(lab.sharpen_radius * scale_factor)
+            sharpen_radius_px = len(kernel) // 2
+            kernel_key = (float(lab.sharpen_radius), float(scale_factor))
+            if self._sharpen_kernel_key != kernel_key:
+                self._buffers["sharpen_k"].upload(kernel)
+                self._sharpen_kernel_key = kernel_key
         l_data = (
             struct.pack(
-                "fffffff",
+                "ffffffffff",
                 float(lab.sharpen),
                 float(lab.chroma_denoise),
-                float(lab.saturation),
+                float(lab.saturation) * grade_chroma_damping(slopes[1], lab.chroma_damping),
                 float(lab.vibrance),
                 float(lab.glow_amount),
                 float(lab.halation_strength),
                 # Chroma-denoise scales its blur radius by the preview downsample ratio,
                 # mirroring the CPU path (radius * scale_factor).
                 float(scale_factor),
+                float(sharpen_radius_px),
+                float(lab.sharpen_masking),
+                1.0 if lab.sharpen_method == SharpenMethod.RL else 0.0,
             )
-            + b"\x00" * 4
+            + b"\x00" * 8
         )
 
         is_bw = 1 if settings.process.process_mode == ProcessMode.BW else 0
@@ -1281,28 +1373,32 @@ class GPUEngine:
             v_full_w, v_full_h, v_off_x, v_off_y = crop_w, crop_h, 0, 0
         else:
             v_full_w, v_full_h, v_off_x, v_off_y = vignette_full_crop
-        f_data = (
-            struct.pack(
-                "ffffff",
-                float(settings.finish.vignette_strength),
-                float(settings.finish.vignette_size),
-                float(v_full_w),
-                float(v_full_h),
-                float(v_off_x),
-                float(v_off_y),
+        carrier_px = 0.0
+        if settings.finish.carrier_width > 0.0:
+            carrier_px = carrier_width_px(
+                settings.finish.carrier_width,
+                settings.export.export_print_size,
+                float(max(v_full_w, v_full_h)),
             )
-            + b"\x00" * 8
+        f_data = struct.pack(
+            "fffffffff",
+            float(settings.finish.vignette_stops),
+            float(settings.finish.vignette_size),
+            float(settings.finish.vignette_roundness),
+            float(v_full_w),
+            float(v_full_h),
+            float(v_off_x),
+            float(v_off_y),
+            float(carrier_px),
+            float(settings.finish.carrier_rough),
         )
 
-        pw, ph, cw, ch, ox, oy = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
-        color_hex = settings.finish.border_color.lstrip("#")
+        pw, ph, cw, ch, ox, oy, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
+        color_hex = PrintService.effective_border_color(settings.finish, settings.toning).lstrip("#")
         bg = tuple(int(color_hex[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
         scale = float(cw) / max(1.0, float(crop_w))
         y_data = (
-            struct.pack("ffffii", bg[0], bg[1], bg[2], 1.0, ox, oy)
-            + struct.pack("iiii", cw, ch, crop_w, crop_h)
-            + struct.pack("f", scale)
-            + b"\x00" * 4
+            struct.pack("ffffii", bg[0], bg[1], bg[2], 1.0, ox, oy) + struct.pack("iiii", cw, ch, crop_w, crop_h) + struct.pack("f", scale)
         )
 
         # ROI offset + crop dims for the density-histogram pass (tex_norm is uncropped).
@@ -1370,8 +1466,9 @@ class GPUEngine:
 
     def _calculate_layout_dims(
         self, settings: WorkspaceConfig, cw: int, ch: int, size_ref: Optional[float]
-    ) -> Tuple[int, int, int, int, int, int]:
-        """Calculates final paper and image dimensions based on print settings."""
+    ) -> Tuple[int, int, int, int, int, int, int]:
+        """Calculates final paper and image dimensions based on print settings.
+        Returns (paper_w, paper_h, content_w, content_h, off_x, off_y, dpi)."""
         mode = settings.export.export_resolution_mode
 
         # Preview path: size_ref is the desired paper long-edge; derive virtual DPI
@@ -1388,12 +1485,15 @@ class GPUEngine:
             paper_long_px = int((settings.export.export_print_size / 2.54) * dpi)
 
         border_px = int((settings.finish.border_size / 2.54) * dpi)
+        weight = max(1.0, float(settings.finish.border_bottom_weight))
+        border_bottom_px = int(border_px * weight)
+        border_y_px = border_px + border_bottom_px
 
         if mode == ExportResolutionMode.ORIGINAL:
             content_w, content_h = cw, ch
 
             if settings.export.paper_aspect_ratio == AspectRatio.ORIGINAL:
-                paper_w, paper_h = content_w + 2 * border_px, content_h + 2 * border_px
+                paper_w, paper_h = content_w + 2 * border_px, content_h + border_y_px
             else:
                 try:
                     w_r, h_r = map(float, settings.export.paper_aspect_ratio.split(":"))
@@ -1402,7 +1502,7 @@ class GPUEngine:
                     paper_ratio = cw / ch
 
                 min_paper_w = content_w + 2 * border_px
-                min_paper_h = content_h + 2 * border_px
+                min_paper_h = content_h + border_y_px
 
                 if (min_paper_w / min_paper_h) > paper_ratio:
                     paper_w = min_paper_w
@@ -1411,17 +1511,17 @@ class GPUEngine:
                     paper_h = min_paper_h
                     paper_w = int(paper_h * paper_ratio)
 
-            off_x, off_y = (paper_w - content_w) // 2, (paper_h - content_h) // 2
+            off_x = (paper_w - content_w) // 2
+            off_y = PrintService.weighted_offset_y(paper_h, content_h, border_px, border_bottom_px)
         else:
             if settings.export.paper_aspect_ratio == AspectRatio.ORIGINAL:
-                content_long_px = max(1, paper_long_px - 2 * border_px)
                 if cw >= ch:
-                    content_w = content_long_px
-                    content_h = max(1, int(ch * (content_long_px / cw)))
+                    content_w = max(1, paper_long_px - 2 * border_px)
+                    content_h = max(1, int(ch * (content_w / cw)))
                 else:
-                    content_h = content_long_px
-                    content_w = max(1, int(cw * (content_long_px / ch)))
-                paper_w, paper_h = content_w + 2 * border_px, content_h + 2 * border_px
+                    content_h = max(1, paper_long_px - border_y_px)
+                    content_w = max(1, int(cw * (content_h / ch)))
+                paper_w, paper_h = content_w + 2 * border_px, content_h + border_y_px
                 off_x, off_y = border_px, border_px
             else:
                 paper_w, paper_h = PrintService.paper_dims_from_long_edge(
@@ -1430,11 +1530,12 @@ class GPUEngine:
                     cw,
                     ch,
                 )
-                inner_w, inner_h = paper_w - 2 * border_px, paper_h - 2 * border_px
+                inner_w, inner_h = paper_w - 2 * border_px, paper_h - border_y_px
                 scale = min(inner_w / cw, inner_h / ch)
                 content_w, content_h = int(cw * scale), int(ch * scale)
 
-                off_x, off_y = (paper_w - content_w) // 2, (paper_h - content_h) // 2
+                off_x = (paper_w - content_w) // 2
+                off_y = PrintService.weighted_offset_y(paper_h, content_h, border_px, border_bottom_px)
 
         max_tex = APP_CONFIG.max_texture_size
         if max_tex is not None:
@@ -1447,8 +1548,9 @@ class GPUEngine:
                 content_h = max(1, int(content_h * s))
                 off_x = int(off_x * s)
                 off_y = int(off_y * s)
+                dpi = max(1, int(dpi * s))
 
-        return paper_w, paper_h, content_w, content_h, off_x, off_y
+        return paper_w, paper_h, content_w, content_h, off_x, off_y, dpi
 
     def _readback_clahe_cdf(self) -> np.ndarray:
         """Reads back the CLAHE CDF buffer from GPU."""
@@ -1748,7 +1850,7 @@ class GPUEngine:
         if settings.exposure.auto_normalize_contrast:
             global_textural_range = measure_textural_range_from_log(_prefiltered(), None, 0.0)
 
-        paper_w, paper_h, content_w, content_h, off_x, off_y = self._calculate_layout_dims(settings, crop_w, crop_h, None)
+        paper_w, paper_h, content_w, content_h, off_x, off_y, _ = self._calculate_layout_dims(settings, crop_w, crop_h, None)
         full_source_res = np.zeros((crop_h, crop_w, 3), dtype=np.float32)
 
         # Heal regions sample up to the membrane ring (radius + 2px·scale) plus
@@ -1765,6 +1867,15 @@ class GPUEngine:
         for _x, _y, size in ret.manual_dust_spots:
             # Legacy spots get a golden-angle fallback offset of 2.6·size px.
             halo = max(halo, int(np.ceil(size * (ref_scale * 0.5 + 2.6))) + rim_px + 2)
+        # The sharpen blur reads ±kernel-radius px, which outgrows TILE_HALO at
+        # export scale factors — without this, tile seams show in the USM band.
+        # RL's influence spreads with iterations but decays geometrically; 6× the
+        # kernel radius covers it in practice (widen if seams appear at extreme
+        # radius×scale). Capped by the 512 ceiling below.
+        if settings.lab.sharpen > 0:
+            k_radius = len(gaussian_kernel_1d(settings.lab.sharpen_radius * scale_factor)) // 2
+            mult = 6 if settings.lab.sharpen_method == SharpenMethod.RL else 1
+            halo = max(halo, k_radius * mult)
         halo = min(halo, 512)
 
         for ty in range(0, crop_h, TILE_SIZE):

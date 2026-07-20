@@ -24,14 +24,16 @@ from negpy.features.flatfield.logic import apply_flatfield, flatfield_token
 from negpy.features.retouch.logic import (
     apply_hair_inpaint,
     apply_ir_attenuation,
+    apply_ir_reconstruction,
     compute_dust_stats,
-    detect_ir_regions,
     detect_luma_regions,
     downsample_ir,
     hair_bake_token,
     ir_bake_token,
+    ir_defect_score,
     ir_detect_cutoff,
     ir_ratio_and_gain,
+    route_ir_defects,
 )
 from negpy.features.rgbscan.logic import merge_rgb_triplet, rgbscan_token
 from negpy.domain.interfaces import PipelineContext
@@ -115,6 +117,10 @@ class ImageProcessor:
         # so creative-slider drags reuse it instead of re-inpainting every frame.
         self._hair_key: Optional[tuple] = None
         self._hair_value: Optional[np.ndarray] = None
+        # IR-baked source (division + score-weighted fill) and its routed mask, keyed
+        # like _hair so creative-slider drags reuse the baked buffer.
+        self._ir_recon_key: Optional[tuple] = None
+        self._ir_recon_value: Optional[tuple] = None
 
         if APP_CONFIG.use_gpu:
             gpu = GPUDevice.get()
@@ -161,19 +167,29 @@ class ImageProcessor:
         ir_buffer: Optional[np.ndarray],
         settings: WorkspaceConfig,
         source_key: str,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], bool]:
-        """IR-division attenuation, baked in source transmittance space before the
-        engine (mirrors apply_flatfield; the GPU re-uploads source each frame, so the
-        bake reaches it parity-free). Returns (corrected_img, corrected_mask_or_None, degenerate)."""
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], bool, Optional[np.ndarray]]:
+        """IR correction baked in source transmittance space before the engine (mirrors
+        apply_flatfield; the GPU re-uploads source each frame, so the bake reaches it
+        parity-free): division attenuation for semi-transparent dust, score-weighted
+        fill for opaque cores. Returns (corrected_img, corrected_mask_or_None, degenerate,
+        routed_mask_or_None) — the routed mask goes to _hair_inpaint."""
         ret = settings.retouch
         if self._is_flat(settings) or ir_buffer is None or not ret.ir_dust_remove:
-            return img, None, False
+            return img, None, False, None
         ratio_det, gain_det, degenerate, _ = self._ir_ratio_gain(ir_buffer, img, source_key)
         if degenerate:
-            return img, None, True
-        if not ret.ir_attenuation:
-            return img, None, False
-        return apply_ir_attenuation(img, gain_det), (ratio_det < 0.97), False
+            return img, None, True, None
+        key = (source_key, round(float(ret.ir_threshold), 6), bool(ret.ir_attenuation), img.shape)
+        if key == self._ir_recon_key and self._ir_recon_value is not None:
+            out, routed = self._ir_recon_value
+        else:
+            score_det = ir_defect_score(ratio_det, ir_detect_cutoff(ret.ir_threshold, ret.ir_attenuation))
+            out = apply_ir_attenuation(img, gain_det) if ret.ir_attenuation else img
+            out = apply_ir_reconstruction(out, score_det)
+            routed = route_ir_defects(score_det)
+            self._ir_recon_key = key
+            self._ir_recon_value = (out, routed)
+        return out, (ratio_det < 0.97), False, routed
 
     def _hair_inpaint(self, img: np.ndarray, hair_masks: List[np.ndarray], cache_key: str) -> np.ndarray:
         """Structure-following inpaint of detected hairs, baked into the source before
@@ -191,30 +207,22 @@ class ImageProcessor:
         self,
         settings: WorkspaceConfig,
         img: np.ndarray,
-        ir_buffer: Optional[np.ndarray],
         source_key: str,
     ) -> Tuple[WorkspaceConfig, Optional[Dict[str, list]], List[np.ndarray]]:
-        """Source-space dust detection → synthesized heal strokes on a
+        """Source-space luma dust detection → synthesized heal strokes on a
         render-local config (auto flags cleared — the engines only see strokes).
         The caller's config is untouched, so synthesized strokes never reach
-        sidecars, presets or the DB. Also returns the detected strokes split by
-        source ({"luma", "ir"}) for the display overlay (or None when detection
-        is off), and the detection-scale hair masks for structure-following inpaint."""
+        sidecars, presets or the DB. Also returns the detected strokes for the
+        display overlay (None when detection is off) and the detection-scale hair
+        masks for inpaint. IR defects never become strokes — _ir_bake repairs them."""
         ret = settings.retouch
-        do_luma = ret.dust_remove
-        do_ir = ret.ir_dust_remove and ir_buffer is not None
-        if self._is_flat(settings) or not (do_luma or do_ir):
+        if self._is_flat(settings) or not ret.dust_remove:
             return settings, None, []
 
         key = (
             source_key,
-            do_luma,
             round(float(ret.dust_threshold), 6),
             int(ret.dust_size),
-            do_ir,
-            round(float(ret.ir_threshold), 6),
-            bool(ret.ir_attenuation),
-            int(ret.ir_inpaint_radius),
             settings.process.process_mode,
         )
         if key == self._retouch_detect_key and self._retouch_detect_value is not None:
@@ -227,35 +235,21 @@ class ImageProcessor:
                 stats = compute_dust_stats(_detection_downsample(img), ret.dust_size)
                 self._dust_stats_key = stats_key
                 self._dust_stats_value = stats
-            synth_ir, hair_ir = [], None
-            if do_ir and ir_buffer is not None:
-                ratio_det, _gain, degenerate, _g = self._ir_ratio_gain(ir_buffer, img, source_key)
-                if not degenerate:
-                    synth_ir, hair_ir = detect_ir_regions(
-                        ratio_det,
-                        ir_detect_cutoff(ret.ir_threshold, ret.ir_attenuation),
-                        pad_px=float(ret.ir_inpaint_radius),
-                        guide=stats[4],
-                    )
-            synth_luma, hair_luma = [], None
-            if do_luma:
-                # Ungated like IR: the detector already confirmed the defect, and
-                # the bright-only gate leaves half-healed fringe rings (halos)
-                # around soft-edged specks (also, E6 dust is dark — gate would
-                # veto it entirely).
-                synth_luma, hair_luma = detect_luma_regions(
-                    _detection_downsample(img), ret.dust_threshold, ret.dust_size, gate=0.0, stats=stats
-                )
-            detected = {"ir": synth_ir, "luma": synth_luma}
-            hair_masks = [m for m in (hair_ir, hair_luma) if m is not None]
+            # Ungated: the detector already confirmed the defect, and the
+            # bright-only gate leaves half-healed fringe rings (halos) around
+            # soft-edged specks (also, E6 dust is dark — gate would veto it).
+            synth_luma, hair_luma = detect_luma_regions(
+                _detection_downsample(img), ret.dust_threshold, ret.dust_size, gate=0.0, stats=stats
+            )
+            detected = {"luma": synth_luma}
+            hair_masks = [hair_luma] if hair_luma is not None else []
             self._retouch_detect_key = key
             self._retouch_detect_value = (detected, hair_masks)
 
-        synth = list(detected["ir"]) + list(detected["luma"])
+        synth = list(detected["luma"])
         budget = max(0, 512 - len(ret.manual_heal_strokes) - len(ret.manual_dust_spots))
         if len(synth) > budget:
             logger.warning("Retouch: healing %d of %d detected defects (region cap)", budget, len(synth))
-            # Keep the largest across ir+luma (IR used to head-truncate luma wholesale).
             synth = sorted(synth, key=lambda s: -s[1])[:budget]
         return (
             dc_replace(
@@ -307,12 +301,14 @@ class ImageProcessor:
             + ir_bake_token(settings.retouch, ir_buffer is not None)
         )
 
-        # Bake IR attenuation before detection so meters/stats see the corrected buffer.
+        # Bake the IR correction before detection so meters/stats see the corrected buffer.
         want_ir = settings.retouch.ir_dust_remove and ir_buffer is not None and not self._is_flat(settings)
-        img, ir_corrected_mask, ir_degenerate = self._ir_bake(img, ir_buffer, settings, base_hash)
+        img, ir_corrected_mask, ir_degenerate, ir_routed = self._ir_bake(img, ir_buffer, settings, base_hash)
 
         orig_ret = settings.retouch
-        settings, detected_dust, hair_masks = self._augment_retouch(settings, img, ir_buffer, base_hash)
+        settings, detected_dust, hair_masks = self._augment_retouch(settings, img, base_hash)
+        if ir_routed is not None:
+            hair_masks = hair_masks + [ir_routed]  # never mutate the cached list
         # Inpaint long/twisted hairs into the source (both engines see it — the token
         # invalidates the base stage when detection params change; empty otherwise).
         hair_token = hair_bake_token(orig_ret) if hair_masks else ""
@@ -336,11 +332,10 @@ class ImageProcessor:
         # source. Absent when detection is off (so the overlay draws nothing).
         if detected_dust is not None:
             context.metrics["detected_dust_luma"] = detected_dust["luma"]
-            context.metrics["detected_dust_ir"] = detected_dust["ir"]
         # Overlay wash over the inpainted hairs (they emit no stroke capsules).
         if hair_masks:
             context.metrics["hair_inpaint_masks"] = hair_masks
-        # Overlay data for the division-corrected regions + the B&W/Kodachrome guard.
+        # Overlay data for the IR-corrected regions (division + fill) + the B&W/Kodachrome guard.
         if want_ir:
             context.metrics["ir_degenerate"] = ir_degenerate
             if ir_corrected_mask is not None:
@@ -489,6 +484,21 @@ class ImageProcessor:
         self._source_cache_value = result
         return result
 
+    @staticmethod
+    def _slice_half_source(
+        f32_buffer: np.ndarray, ir_full: Optional[np.ndarray], half: int, split_x: float
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Slice a decoded source down to one half-frame; copies so the shared
+        per-file decode cache is never mutated downstream. No-op when half == 0."""
+        if not half:
+            return f32_buffer, ir_full
+        from negpy.services.assets.half_frame import slice_half
+
+        f32_buffer = np.ascontiguousarray(slice_half(f32_buffer, half, split_x))
+        if ir_full is not None:
+            ir_full = np.ascontiguousarray(slice_half(ir_full, half, split_x))
+        return f32_buffer, ir_full
+
     def process_export(
         self,
         file_path: str,
@@ -499,6 +509,8 @@ class ImageProcessor:
         prefer_gpu: bool = True,
         bounds_override: Optional[Any] = None,
         working_color_space: str = WORKING_COLOR_SPACE,
+        half: int = 0,
+        split_x: float = 0.5,
     ) -> Tuple[Optional[bytes], str]:
         """Performs high-resolution export with color management."""
         try:
@@ -506,6 +518,7 @@ class ImageProcessor:
             params = dc_replace(params, export=export_settings)
 
             f32_buffer, ir_full, source_cs = self._load_source_f32(file_path, params)
+            f32_buffer, ir_full = self._slice_half_source(f32_buffer, ir_full, half, split_x)
             target_cs = export_settings.export_color_space
             if target_cs == ColorSpace.SAME_AS_SOURCE.value:
                 target_cs = source_cs
@@ -518,9 +531,11 @@ class ImageProcessor:
                 + linear_raw_token(params.process)
                 + ir_bake_token(params.retouch, ir_full is not None)
             )
-            f32_buffer, _, _ = self._ir_bake(f32_buffer, ir_full, params, detect_key)
+            f32_buffer, _, _, ir_routed = self._ir_bake(f32_buffer, ir_full, params, detect_key)
             orig_ret = params.retouch
-            params, _, hair_masks = self._augment_retouch(params, f32_buffer, ir_full, detect_key)
+            params, _, hair_masks = self._augment_retouch(params, f32_buffer, detect_key)
+            if ir_routed is not None:
+                hair_masks = hair_masks + [ir_routed]
             if hair_masks:
                 f32_buffer = self._hair_inpaint(f32_buffer, hair_masks, detect_key + hair_bake_token(orig_ret))
 
@@ -605,7 +620,7 @@ class ImageProcessor:
                 img_int = np.stack([img_lum, img_lum, img_lum], axis=-1) if img_lum.ndim == 2 else img_lum
             else:
                 img_int = float_to_uint16(buffer)
-            img_out, _icc = self._apply_color_management_u16_rgb(img_int, working_color_space, color_space, icc_output, icc_input)
+            img_out, _icc = self._apply_color_management_u16(img_int, working_color_space, color_space, icc_output, icc_input)
             return self._encode_dng_bytes(img_out), "dng"
         elif fmt == ExportFormat.PNG:
             if is_greyscale:
@@ -642,7 +657,7 @@ class ImageProcessor:
                 img_out, _icc = self._apply_color_management_u16_greyscale(img_int, working_color_space, color_space, icc_output, icc_input)
             else:
                 img_int = float_to_uint16(buffer)
-                img_out, _icc = self._apply_color_management_u16_rgb(img_int, working_color_space, color_space, icc_output, icc_input)
+                img_out, _icc = self._apply_color_management_u16(img_int, working_color_space, color_space, icc_output, icc_input)
             bits = imagecodecs.jpegxl_encode(
                 np.ascontiguousarray(img_out),
                 bitspersample=16,
@@ -716,6 +731,8 @@ class ImageProcessor:
         prefer_gpu: bool = True,
         working_color_space: str = WORKING_COLOR_SPACE,
         fast_decode: bool = False,
+        half: int = 0,
+        split_x: float = 0.5,
     ) -> Optional[np.ndarray]:
         """Render a file (with its edits) to a small sRGB uint8 RGB array for tiling.
 
@@ -726,6 +743,7 @@ class ImageProcessor:
             from negpy.infrastructure.display.color_mgmt import apply_display_transform
 
             f32_buffer, ir_full, _ = self._load_source_f32(file_path, params, fast_decode=fast_decode)
+            f32_buffer, ir_full = self._slice_half_source(f32_buffer, ir_full, half, split_x)
             h_raw, w_raw = f32_buffer.shape[:2]
             scale_factor = max(1.0, max(h_raw, w_raw) / float(target_long_px))
 
@@ -736,9 +754,11 @@ class ImageProcessor:
                 + linear_raw_token(params.process)
                 + ir_bake_token(params.retouch, ir_full is not None)
             )
-            f32_buffer, _, _ = self._ir_bake(f32_buffer, ir_full, params, detect_key)
+            f32_buffer, _, _, ir_routed = self._ir_bake(f32_buffer, ir_full, params, detect_key)
             orig_ret = params.retouch
-            params, _, hair_masks = self._augment_retouch(params, f32_buffer, ir_full, detect_key)
+            params, _, hair_masks = self._augment_retouch(params, f32_buffer, detect_key)
+            if ir_routed is not None:
+                hair_masks = hair_masks + [ir_routed]
             if hair_masks:
                 f32_buffer = self._hair_inpaint(f32_buffer, hair_masks, detect_key + hair_bake_token(orig_ret))
 
@@ -771,7 +791,11 @@ class ImageProcessor:
     def _apply_scaling_and_border_f32(self, img: np.ndarray, params: WorkspaceConfig, export_settings: ExportConfig) -> np.ndarray:
         """CPU fallback for layout application."""
         result, _ = PrintService.apply_layout(
-            img, export_settings, border_size=params.finish.border_size, border_color=params.finish.border_color
+            img,
+            export_settings,
+            border_size=params.finish.border_size,
+            border_color=PrintService.effective_border_color(params.finish, params.toning),
+            finish=params.finish,
         )
         return result
 

@@ -8,12 +8,14 @@ from negpy.kernel.image.validation import ensure_image
 from negpy.kernel.image.logic import working_oetf_encode
 from negpy.kernel.system.logging import get_logger
 from negpy.features.geometry.processor import GeometryProcessor, CropProcessor
+from negpy.features.exposure import models as exposure_models
 from negpy.features.exposure.models import RenderIntent
 from negpy.features.exposure.processor import (
     NormalizationProcessor,
     PhotometricProcessor,
 )
 from negpy.features.toning.processor import ToningProcessor
+from negpy.features.lab.logic import apply_clahe
 from negpy.features.lab.processor import PhotoLabProcessor
 from negpy.features.retouch.processor import RetouchProcessor
 from negpy.features.finish.processor import FinishProcessor
@@ -82,6 +84,7 @@ class DarkroomEngine:
             self.cache.process_mode = settings.process.process_mode
             self.cache.base = None
             self.cache.exposure = None
+            self.cache.clahe = None
             self.cache.retouch = None
             self.cache.lab = None
             pipeline_changed = True
@@ -143,6 +146,10 @@ class DarkroomEngine:
             settings.process.crosstalk_matrix,
             settings.process.lock_bounds,
             distortion_k1,
+            # Auto Density metering reads retuned targets from EXPOSURE_CONSTANTS,
+            # which no config hash sees; the revision keys them in. Re-running base
+            # sets pipeline_changed, so the exposure stage follows.
+            exposure_models.TARGETS_REVISION,
         )
         current_img, pipeline_changed = self._run_stage(current_img, base_key, "base", run_base, context, pipeline_changed)
 
@@ -167,6 +174,20 @@ class DarkroomEngine:
 
         if not flat_intent:
 
+            def run_clahe(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
+                return apply_clahe(img_in, settings.lab.clahe_strength)
+
+            # Keyed on the bare float: the full settings.lab would wrongly invalidate
+            # this stage (and retouch/lab behind it) on saturation/sharpen edits.
+            current_img, pipeline_changed = self._run_stage(
+                current_img,
+                settings.lab.clahe_strength,
+                "clahe",
+                run_clahe,
+                context,
+                pipeline_changed,
+            )
+
             def run_retouch(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
                 return RetouchProcessor(settings.retouch).process(img_in, ctx)
 
@@ -190,7 +211,7 @@ class DarkroomEngine:
             current_img = CropProcessor(settings.geometry).process(current_img, context)
 
         if not flat_intent:
-            current_img = FinishProcessor(settings.finish).process(current_img, context)
+            current_img = FinishProcessor(settings.finish, settings.export.export_print_size).process(current_img, context)
             # Output transform: scene-linear -> display-encoded (flat master skips this).
             current_img = ensure_image(working_oetf_encode(current_img))
 

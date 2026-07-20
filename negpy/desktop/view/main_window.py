@@ -26,7 +26,7 @@ from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.loading_overlay import LoadingOverlay
 from negpy.desktop.view.widgets.pinnable_dock import PinnableDockWidget
 from negpy.desktop.view.widgets.progress_dialog import ProgressDialog
-from negpy.domain.models import AspectRatio, ColorSpace
+from negpy.domain.models import AspectRatio
 from negpy.infrastructure.gpu.resources import GPUTexture
 from negpy.kernel.image.logic import float_to_uint8
 from negpy.kernel.system.config import APP_CONFIG
@@ -476,24 +476,17 @@ class MainWindow(QMainWindow):
                         export_conf.paper_aspect_ratio,
                         finish_conf.border_size,
                         export_conf.export_print_size,
-                        finish_conf.border_color,
+                        PrintService.effective_border_color(finish_conf, self.state.config.toning),
                         APP_CONFIG.preview_render_size,
+                        finish=finish_conf,
                     )
                     buffer = np.array(pil_img).astype(np.float32) / 255.0
                 except Exception as e:
                     logger.error(f"Border preview failure: {e}")
 
-        # With a proof active the render worker already baked the full
-        # source→output→monitor transform into the buffer, so the display step must be
-        # a no-op (pass no monitor profile) to avoid converting to the monitor twice.
-        # Otherwise the buffer is in the assumed source space and needs source→monitor.
-        icc_active = self.controller.proof_active()
-        if metrics.get("splash"):  # embedded sRGB thumbnail, not a working-space render
-            display_cs = ColorSpace.SRGB.value
-            monitor_bytes = self.state.monitor_icc_bytes
-        else:
-            display_cs = ColorSpace.SRGB.value if icc_active else self.state.workspace_color_space
-            monitor_bytes = None if icc_active else self.state.monitor_icc_bytes
+        # Shared with the filmstrip thumbnail so the same frame can't render two
+        # different colours in the two places (see display_transform_params).
+        display_cs, monitor_bytes = self.controller.display_transform_params(splash=bool(metrics.get("splash")))
         self.canvas.update_buffer(buffer, display_cs, content_rect=content_rect, monitor_icc_bytes=monitor_bytes)
 
     def _refresh_image_info(self) -> None:

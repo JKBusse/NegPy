@@ -94,6 +94,7 @@ SLIDER_GROUPS: tuple[SliderShortcutGroup, ...] = (
     _g("separation", "Crosstalk ↑/↓", "separation_inc", "separation_dec", 0.01, "Process"),
     _g("chroma_denoise", "Denoise ↑/↓", "chroma_denoise_inc", "chroma_denoise_dec", 0.01, "Lab"),
     _g("saturation", "Saturation ↑/↓", "saturation_inc", "saturation_dec", 0.01, "Lab"),
+    _g("chroma_damping", "Dye Mute ↑/↓", "chroma_damping_inc", "chroma_damping_dec", 0.01, "Lab"),
     _g("vibrance", "Vibrance ↑/↓", "vibrance_inc", "vibrance_dec", 0.01, "Lab"),
     _g("clahe", "CLAHE ↑/↓", "clahe_inc", "clahe_dec", 0.01, "Lab"),
     _g("sharpen", "Sharpening ↑/↓", "sharpen_inc", "sharpen_dec", 0.01, "Lab"),
@@ -108,7 +109,7 @@ SLIDER_GROUPS: tuple[SliderShortcutGroup, ...] = (
     _g("shadow_strength", "Shadow strength ↑/↓", "shadow_strength_inc", "shadow_strength_dec", 0.01, "Toning"),
     _g("highlight_hue", "Highlight hue ↑/↓", "highlight_hue_inc", "highlight_hue_dec", 0.01, "Toning"),
     _g("highlight_strength", "Highlight strength ↑/↓", "highlight_strength_inc", "highlight_strength_dec", 0.01, "Toning"),
-    _g("vignette_str", "Vignette strength ↑/↓", "vignette_str_inc", "vignette_str_dec", 0.01, "Finishing"),
+    _g("vignette_str", "Vignette burn ↑/↓", "vignette_str_inc", "vignette_str_dec", 0.01, "Finishing"),
     _g("vignette_size", "Vignette size ↑/↓", "vignette_size_inc", "vignette_size_dec", 0.01, "Finishing"),
     _g("border_size", "Border width ↑/↓", "border_size_inc", "border_size_dec", 0.01, "Finishing"),
 )

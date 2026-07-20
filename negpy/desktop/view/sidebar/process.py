@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 from negpy.desktop.session import ToolMode
 from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.sidebar.tone import _CH_COLORS, _CH_LABEL, _CH_SUFFIX
-from negpy.desktop.view.styles.templates import field_label, section_subheader
+from negpy.desktop.view.styles.templates import EditedDot, field_label, section_subheader
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.sliders import CompactSlider
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS
@@ -92,8 +92,16 @@ class ProcessSidebar(BaseSidebar):
             conf.linear_raw,
             "Decode RAW with neutral multipliers (1,1,1,1) — bypasses as-shot camera white balance for a clean starting point",
         )
+        self.narrowband_scan_btn = self._small_toggle(
+            "mdi6.led-strip-variant",
+            "Narrowband",
+            conf.narrowband_scan,
+            "Correct trichrome narrowband RGB scans oversaturation with the bundled input profile "
+            "An explicit Input ICC in Export settings overrides it",
+        )
         raw_row = QHBoxLayout()
         raw_row.addWidget(self.linear_raw_btn, 1)
+        raw_row.addWidget(self.narrowband_scan_btn, 1)
         raw_row.addWidget(self.lock_bounds_btn, 1)
         self.layout.addLayout(raw_row)
 
@@ -106,6 +114,9 @@ class ProcessSidebar(BaseSidebar):
             "(overrides the Analysis Buffer). Double-click inside it to confirm.",
         )
         self.analysis_region_btn.setFixedWidth(32)
+        # Confirming a region closes the tool (unchecking the toggle), so the dot is
+        # the only cue left that it's still overriding the Analysis Buffer slider.
+        self.analysis_region_btn.edited_dot = EditedDot(self.analysis_region_btn)
         self.clear_analysis_region_btn = self._icon_action(
             "fa5s.times", "Clear the freehand analysis region (fall back to the Analysis Buffer)", width=32
         )
@@ -216,6 +227,7 @@ class ProcessSidebar(BaseSidebar):
         self.autodetect_btn.toggled.connect(lambda c: self.controller.toggle_autodetect(c))
         self.lock_bounds_btn.toggled.connect(self._on_lock_bounds_toggled)
         self.linear_raw_btn.toggled.connect(self._on_linear_raw_toggled)
+        self.narrowband_scan_btn.toggled.connect(self._on_narrowband_scan_toggled)
 
         self.analysis_buffer_slider.valueChanged.connect(lambda v: self._on_buffer_changed(v, persist=False))
         self.analysis_buffer_slider.valueCommitted.connect(lambda v: self._on_buffer_changed(v, persist=True))
@@ -266,6 +278,9 @@ class ProcessSidebar(BaseSidebar):
         self.controller.session.update_config(new_config, persist=True, render=False)
         if self.state.current_file_path:
             self.controller.load_file(self.state.current_file_path)
+
+    def _on_narrowband_scan_toggled(self, checked: bool) -> None:
+        self.update_config_section("process", narrowband_scan=checked, persist=True, render=True)
 
     def _on_mode_changed(self, mode: str) -> None:
         self.update_config_section(
@@ -427,6 +442,7 @@ class ProcessSidebar(BaseSidebar):
 
             self.lock_bounds_btn.setChecked(conf.lock_bounds)
             self.linear_raw_btn.setChecked(conf.linear_raw)
+            self.narrowband_scan_btn.setChecked(conf.narrowband_scan)
 
             profiles = CrosstalkProfiles.list_profiles()
             if profiles != [self.crosstalk_combo.itemText(i) for i in range(self.crosstalk_combo.count())]:
@@ -443,6 +459,7 @@ class ProcessSidebar(BaseSidebar):
 
             has_region = conf.analysis_rect is not None
             self.analysis_region_btn.setChecked(self.state.active_tool == ToolMode.ANALYSIS_DRAW)
+            self.analysis_region_btn.edited_dot.set_active(has_region)
             self.clear_analysis_region_btn.setEnabled(has_region)
 
             locked = conf.lock_bounds
@@ -469,6 +486,7 @@ class ProcessSidebar(BaseSidebar):
             self.autodetect_btn,
             self.lock_bounds_btn,
             self.linear_raw_btn,
+            self.narrowband_scan_btn,
             self.ch_global_btn,
             self.ch_r_btn,
             self.ch_g_btn,

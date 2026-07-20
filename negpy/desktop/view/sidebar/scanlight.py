@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QSlider,
@@ -35,10 +36,29 @@ from negpy.desktop.view.styles.templates import section_subheader
 from negpy.desktop.view.styles.theme import THEME
 from negpy.infrastructure.capture.gphoto import default_settings_path
 from negpy.infrastructure.capture.settings import ScanlightSettings
-from negpy.services.capture.calibration import shutter_seconds
+from negpy.services.capture.calibration import REFERENCE_LEVELS, SHUTTER_CANDIDATES, normalize_start_point, shutter_seconds, usable_ladder
 from negpy.services.capture.presets import PresetStore, ScanlightPreset
 
 _CHANNEL_COLORS = {"R": "#E24B4A", "G": "#639922", "B": "#378ADD", "W": "#B4B2A9"}
+
+# Amber for advisory state — the same tone the LED-temperature readout warms to.
+_WARN_COLOR = "#C8922E"
+
+# One source for the over/under advice, worded once and shown on both surfaces of an aborted
+# calibration (the calibration window's status line and the pop-up):
+# (label, cause — a full sentence for the pop-up, fix — lowercase so the strip can inline it).
+_EXPOSURE_WARNINGS = {
+    "over": (
+        "over-exposed",
+        "Even the fastest shutter with the LEDs at their minimum still clips the film base.",
+        "close the aperture (e.g. f/11) or lower the ISO, then recalibrate",
+    ),
+    "under": (
+        "under-exposed",
+        "Even the slowest shutter with the LEDs at their maximum stays below the exposure target.",
+        "open the aperture (e.g. f/5.6) or raise the ISO, then recalibrate",
+    ),
+}
 
 # Built-in white-light preset (no calibration needed): name → process mode.
 # Selecting it switches the panel to a single white-light exposure. B&W and slide/E-6
@@ -52,9 +72,10 @@ _MANUAL_PRESET = "\x00create-manual"
 
 
 # LED settle before each exposure. Narrowband PWM LEDs reach full brightness in <10 ms
-# and the serial set_color round-trip is ~5-20 ms, so 150 ms is a safe margin (the old
-# 400 ms was conservative). A fixed tuning constant, not a user/persisted setting.
-_LED_SETTLE_S = 0.15
+# and set_color is a fire-and-forget serial write (~1 ms on the wire at 115200 baud plus
+# CDC scheduling), so 50 ms still carries an order-of-magnitude margin (150/400 ms before
+# were conservatism). A fixed tuning constant, not a user/persisted setting.
+_LED_SETTLE_S = 0.05
 
 
 class _NoWheel(QObject):
@@ -79,6 +100,8 @@ class ScanlightSidebar(QWidget):
         self._manual_mode = False  # True while building a preset by hand (sliders + exposure editable)
         self._manual_populate_pending = False  # seed the sidebar exposure steppers from the body once, then let the user drive
         self._calibrating_preset = ""  # non-empty while the "+" calibration flow is saving a new preset
+        self._status_pinned = False  # a pinned status (calibration outcome) outranks the light echo
+        self._exposure_popup = None  # the over/under pop-up (kept referenced; replaced per calibration)
         self._magnifier_on = False  # camera focus magnifier state (driven by clicks on the live image)
         self._settings_loaded = False  # have the live camera-setting dropdowns been populated yet?
         self._slider_readouts: dict = {}  # slider → its value label (updated on preset apply, where signals are blocked)
@@ -374,6 +397,7 @@ class ScanlightSidebar(QWidget):
 
         self.controller.capture_light_set.connect(self._on_light_set)
         self.controller.capture_progress.connect(self._on_progress)
+        self.controller.capture_channel.connect(self._on_channel)
         self.controller.capture_finished.connect(self._on_finished)
         self.controller.capture_cancelled.connect(self._on_cancelled)
         self.controller.capture_error.connect(self._on_error)
@@ -381,8 +405,10 @@ class ScanlightSidebar(QWidget):
         self.controller.capture_live_view_started.connect(self._on_live_view_started)
         self.controller.capture_calibration_progress.connect(self._on_calibration_progress)
         self.controller.capture_calibration_finished.connect(self._on_calibration_finished)
+        self.controller.capture_calibration_exposure.connect(self._on_calibration_exposure)
         self.controller.connection_polled.connect(self._on_poll_status)
         self.controller.light_temp_polled.connect(self._on_light_temp)
+        self.controller.batch_started.connect(self._keep_scan_windows_on_top)
         # Pop-up toolbar mirrors the panel actions (scan a roll without tab-switching).
         self.lv_window.scanRequested.connect(self._on_scan)
         self.lv_window.retakeRequested.connect(self._on_retake)
@@ -437,6 +463,12 @@ class ScanlightSidebar(QWidget):
 
     @pyqtSlot(int, int, int, int)
     def _on_light_set(self, r: int, g: int, b: int, w: int) -> None:
+        # Ambient echo, not a user action: _on_calibration_finished sets the R/G/B sliders, each of
+        # which starts the light debounce, and this slot fires ~60 ms later — right after the
+        # calibration outcome ("Saved preset … ⚠ over-exposed …") was written. Declining to replace
+        # a pinned outcome is what keeps that advice on screen; the slider readouts echo the levels.
+        if self._status_pinned:
+            return
         self._set_status(f"Light: W{w}" if w else f"Light: R{r} G{g} B{b}")
 
     # ── presets ───────────────────────────────────────────────────────
@@ -642,8 +674,13 @@ class ScanlightSidebar(QWidget):
         self._update_settings_from_ui()
         self._lv_target = self.calib_window.image
         self.calib_window.start()
-        self._start_live_view_worker()  # white-light framing for the crosshair
-        self._push_light()
+        self._start_live_view_worker()  # live-view stream for the crosshair
+        # Framing light = the calibration's own fixed start point (REFERENCE_LEVELS), so the crosshair
+        # is placed under the very light the probe will begin from — not the previously selected
+        # preset's leftover RGB, nor an arbitrary neutral grey. Pushed DIRECTLY, leaving the shared
+        # R/G/B/W sliders on the selected preset, so cancelling the calibration (or handing off to the
+        # scan window) restores the preset's own light. Calibration overwrites R/G/B on success.
+        self.controller.set_scanlight_color(*REFERENCE_LEVELS, 0, self._settings.port)
         self._set_status("Calibrating a new preset — see the pop-up.")
 
     def _settings_json(self) -> dict:
@@ -695,19 +732,22 @@ class ScanlightSidebar(QWidget):
                     break
 
     def _available_shutters(self) -> tuple[str, ...]:
-        """The camera's writable shutter labels (from the live-view settings JSON), fastest-first
-        and ≤ 1 s, so calibration solves on *this* body's ladder. Empty → built-in fallback."""
+        """The camera's writable shutter labels (from the live-view settings JSON), fastest-first,
+        clamped to the solver's own ladder span, so calibration solves on *this* body's ladder.
+
+        The bounds are read from SHUTTER_CANDIDATES rather than repeated here: this per-body ladder
+        takes precedence over the built-in fallback, so any limit the solver relies on must hold for
+        it too, or the two silently disagree depending on whether live view had published a ladder.
+        Both ends carry a reason — the ceiling keeps the under-exposure cure reachable (a stopped-down
+        aperture needs the slow end), and the floor keeps the PWM-lit LED out of banding: at the
+        Scanlight's 40 kHz a 1/250 s frame integrates ~160 pulses, but a body's 1/8000 s catches ~5
+        and meters noise instead of light."""
         data = self._settings_json()
-        by_seconds: dict[str, float] = {}
-        for o in (data.get("shutter") or {}).get("options", []):
-            label = str(o.get("label", "")).strip()
-            try:
-                seconds = shutter_seconds(label)
-            except (TypeError, ValueError):
-                continue
-            if 0.0 < seconds <= 1.0:
-                by_seconds[label] = seconds
-        return tuple(sorted(by_seconds, key=by_seconds.__getitem__))
+        floor, ceiling = shutter_seconds(SHUTTER_CANDIDATES[0]), shutter_seconds(SHUTTER_CANDIDATES[-1])
+        labels = tuple(str(o.get("label", "")).strip() for o in (data.get("shutter") or {}).get("options", []))
+        # usable_ladder drops the unparseables (bulb-like "1/0", "Bulb", "") and returns ascending =
+        # fastest-first; the range clamp on top is this UI's own policy, not the solver's.
+        return tuple(label for label in usable_ladder(labels) if floor <= shutter_seconds(label) <= ceiling)
 
     def _on_calibrate_new_preset(self, name: str) -> None:
         if self._scanning:
@@ -725,18 +765,30 @@ class ScanlightSidebar(QWidget):
         # It's torn down when calibration finishes/fails (_stop_calibration_live_view).
         self._calibrating_preset = name
         self._apply_gating()  # a running calibration locks Scan / Retake
+        self.calib_window.set_inputs_locked(True)  # freeze name / ROI / ISO / aperture while it meters
         self._update_settings_from_ui()
         from negpy.desktop.workers.capture_worker import CalibrationRequest
 
         s = self._settings
         self.calib_window.set_progress(0.0)
+        # Phase 1: scale the fixed reference start point to the body's live ISO/aperture so the probe
+        # begins near target (fewer captures). Levels stay fixed; only the shutter is corrected. On a
+        # manual lens the aperture reads blank → ISO-only correction, and the probe absorbs the rest.
+        candidates = self._available_shutters()
+        start_levels, start_shutter = normalize_start_point(
+            self._current_setting_label("iso"),
+            self._current_setting_label("aperture", require_writable=True),
+            candidates=candidates,
+        )
         self.controller.start_calibration(
             CalibrationRequest(
                 roi=roi,
                 output_folder=s.output_folder or "",
                 port=s.port,
                 settle_s=_LED_SETTLE_S,
-                shutter_candidates=self._available_shutters(),
+                shutter_candidates=candidates,
+                start_levels=start_levels,
+                start_shutter=start_shutter,
             )
         )
 
@@ -848,6 +900,15 @@ class ScanlightSidebar(QWidget):
             self.lv_btn.setChecked(False)  # stops live view via _on_live_view_toggled(False)
         self._maybe_release_camera_session(closing=self.lv_window)
 
+    def _keep_scan_windows_on_top(self, _title: str, _abortable: bool) -> None:
+        """The batch progress popup shows itself with raise_() on every batch — including the
+        per-frame "Hashing files"/"Generating thumbnails" imports after a capture — which puts
+        it over the live-view pop-up and reads as "wait here" mid-roll. Re-raise the operator's
+        open scan windows one event-loop turn later (the popup's own raise_() runs first)."""
+        for window in (self.lv_window, self.calib_window):
+            if window.isVisible():
+                QTimer.singleShot(0, window.raise_)
+
     def _refresh_live_view(self) -> None:
         if not self._lv_jpeg_path:
             return
@@ -872,8 +933,13 @@ class ScanlightSidebar(QWidget):
         self._lv_last_mtime = mtime
         self._lv_frames_seen += 1
         self._lv_target.set_frame(pixmap)  # scan pop-up or the calibration window
-        if self._lv_target is self.lv_image and self._lv_frames_seen % 12 == 0:
-            self._refresh_camera_settings()  # ~1×/s: keep the ISO/shutter/aperture dropdowns fresh
+        if self._lv_frames_seen % 12 == 0:
+            # ~1×/s: keep the ISO/shutter/aperture dropdowns fresh in whichever pop-up is streaming.
+            # This was gated to the scan window, so opening the calibration pop-up straight after
+            # camera idle left its ISO/aperture greyed out (the body reports them non-writable for
+            # the first frames and nothing re-read the flag) until the scan window was opened once —
+            # Bug 1. _refresh_camera_settings still skips the calib steppers while a run locks them.
+            self._refresh_camera_settings()
 
     def _after_capture_live_view(self) -> None:
         """Re-light the preview after a scan. An in-session capture leaves the Scanlight
@@ -941,10 +1007,16 @@ class ScanlightSidebar(QWidget):
         except (OSError, ValueError):
             return
         steppers = {
-            "iso": [self.lv_window.iso_stepper, self.calib_window.iso_stepper],
+            "iso": [self.lv_window.iso_stepper],
             "shutter": [self.lv_window.shutter_stepper],
-            "aperture": [self.lv_window.aperture_stepper, self.calib_window.aperture_stepper],
+            "aperture": [self.lv_window.aperture_stepper],
         }
+        # The calibration pop-up's ISO/aperture are frozen while it meters at them (set_inputs_locked);
+        # only mirror the body onto them when no calibration is running, or the refresh would re-enable
+        # the disabled steppers mid-run.
+        if not self._calibrating_preset:
+            steppers["iso"].append(self.calib_window.iso_stepper)
+            steppers["aperture"].append(self.calib_window.aperture_stepper)
         # The sidebar steppers are *controllers* in manual mode (the body follows them), not mirrors,
         # so seed them from the body's choices only once — otherwise this periodic refresh would snap
         # the user's picks back to the body whenever a write hasn't landed (e.g. no live session yet).
@@ -1008,6 +1080,9 @@ class ScanlightSidebar(QWidget):
         self.r_slider.setValue(int(levels[0]))
         self.g_slider.setValue(int(levels[1]))
         self.b_slider.setValue(int(levels[2]))
+        # RGB preset → white LED off. Without this the W slider keeps a prior white preset's 255,
+        # which _update_settings_from_ui below would then bake into the saved preset as w_level=255.
+        self._set_slider(self.w_slider, 0)
         shutter = shutters[0]  # one shared shutter (all three are equal)
         self._show_lone(self.shutter_stepper, shutter)
         self._settings = replace(
@@ -1018,16 +1093,55 @@ class ScanlightSidebar(QWidget):
         self._apply_preset_exposure(self._current_setting_label("iso"), self._current_setting_label("aperture", require_writable=True))
         self._update_settings_from_ui()
         self._save_settings()
+        # A finished run is on target on every channel (anything else aborts via
+        # _on_calibration_exposure before a result exists) and always carries its preset name: the
+        # flow refuses to start without one, and the marker is cleared only on a terminal outcome
+        # (the worker emits exactly one of finished/exposure/cancelled/error). The guard remains
+        # because saving under an empty name would write a nameless preset into the store.
         if self._calibrating_preset:
             name = self._calibrating_preset
             self._calibrating_preset = ""
             self._save_current_as_preset(name)  # persist + reload + select + re-gate (bakes settings.iso/aperture)
             self._lv_target = self.lv_image
             self.calib_window.hide()
-            self._set_status(f"Saved preset “{name}”.")
-        else:
-            self._set_status("Calibrated — review, then Save as a preset.")
+            # Pinned: the slider writes above armed the 60 ms light debounce, whose light_set echo
+            # lands right after this line — without the pin it replaced this outcome with
+            # "Light: R… G… B…" before anyone could read it.
+            self._set_status(f"Saved preset “{name}”.", pinned=True)
         self._stop_calibration_live_view()  # calibration ran inside live view → tear it down
+
+    @pyqtSlot(str)
+    def _on_calibration_exposure(self, status: str) -> None:
+        """The solver proved the exposure target unreachable ("over"/"under") and aborted — no
+        preset exists. The calibration window stays a LIVE retry surface: unlike the cancel/error
+        terminal, the live view keeps streaming into it (steppers keep mirroring the body, the ROI
+        sits on a live frame) and the framing light is re-lit — the service switched the Scanlight
+        off on its way out, and a black window here read as a crash on the rig. The user adjusts
+        the aperture and recalibrates right there; the same advice lands in a pop-up."""
+        name = self._calibrating_preset  # read before clearing (the pop-up names the preset)
+        self._calibrating_preset = ""
+        label, _cause, fix = _EXPOSURE_WARNINGS.get(status, _EXPOSURE_WARNINGS["over"])
+        self.calib_window.set_inputs_locked(False)  # re-enable name / ROI / ISO / aperture for the retry
+        self.calib_window.set_status(f"⚠ {label} — {fix}.")
+        self.calib_window.progress.setVisible(False)
+        self._apply_gating()  # re-enable Scan — the capture thread is free again
+        self.controller.set_scanlight_color(*REFERENCE_LEVELS, 0, self._settings.port)  # re-light for framing
+        self._show_exposure_warning(name, status)
+
+    def _show_exposure_warning(self, name: str, status: str) -> None:
+        """The abort reason as a pop-up. The calibration window shows the same advice, but a run
+        that ends without a preset deserves an unmissable surface. Non-blocking (show, not exec):
+        the teardown behind it continues, and the pop-up is replaced on the next calibration."""
+        label, cause, fix = _EXPOSURE_WARNINGS.get(status, _EXPOSURE_WARNINGS["over"])
+        if self._exposure_popup is not None:
+            self._exposure_popup.close()
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Calibration stopped")
+        box.setText(f"“{name}” was not saved — the film base is {label}.")
+        box.setInformativeText(f"{cause} {fix[0].upper()}{fix[1:]}.")
+        box.show()
+        self._exposure_popup = box
 
     # ── browse ────────────────────────────────────────────────────────
 
@@ -1132,18 +1246,29 @@ class ScanlightSidebar(QWidget):
             aperture=s.aperture if rgb and not s.white_mode else "",
         )
         self.set_scanning(True)
+        if rgb and not req.white_mode:
+            # Triplet progress arrives only after each channel (~1.4 s apart); show the bar
+            # at 0% right away so the click has immediate feedback. White/normal captures
+            # emit no progress events, so a bar would just sit at 0% — skip it there.
+            self.lv_window.set_progress(0.0)
         self.controller.start_capture(req)
 
     @pyqtSlot(float)
     def _on_progress(self, progress: float) -> None:
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(int(progress * 100))
+        self.lv_window.set_progress(progress)
+
+    @pyqtSlot(str)
+    def _on_channel(self, letter: str) -> None:
+        self.lv_window.set_channel(letter)
 
     @pyqtSlot(list)
     def _on_finished(self, paths: list) -> None:
         self.set_scanning(False)
         self.progress_bar.setVisible(False)
         frame = paths[0].split("_Frame")[-1][:3] if paths else ""
+        self.lv_window.flash_captured(frame)
         self._set_status(f"Captured frame {frame} — inverting in NegPy…")
         self._after_capture_live_view()  # re-light the still-running preview
 
@@ -1151,6 +1276,7 @@ class ScanlightSidebar(QWidget):
     def _on_cancelled(self) -> None:
         self.set_scanning(False)
         self.progress_bar.setVisible(False)
+        self.lv_window.clear_progress()
         if self._calibrating_preset:
             self._finish_calibration_terminal("Calibration cancelled.")
             self._set_status("Calibration cancelled.")
@@ -1161,6 +1287,7 @@ class ScanlightSidebar(QWidget):
     def _finish_calibration_terminal(self, status: str) -> None:
         """Restore the scan UI after calibration stops without producing a preset."""
         self._calibrating_preset = ""
+        self.calib_window.set_inputs_locked(False)  # re-enable name / ROI / ISO / aperture for a retry
         self.calib_window.set_status(status)
         self.calib_window.progress.setVisible(False)
         self._lv_target = self.lv_image
@@ -1172,6 +1299,7 @@ class ScanlightSidebar(QWidget):
     def _on_error(self, msg: str) -> None:
         self.set_scanning(False)
         self.progress_bar.setVisible(False)
+        self.lv_window.clear_progress()
         if self._calibrating_preset:
             # New-preset calibration failed: report in the pop-up, drop back to the scan target.
             self._finish_calibration_terminal(f"Calibration failed: {msg}")
@@ -1186,8 +1314,13 @@ class ScanlightSidebar(QWidget):
     def _on_status(self, msg: str) -> None:
         self._set_status(msg)
 
-    def _set_status(self, text: str) -> None:
-        """Show a status line on the panel and mirror it into the live-view pop-up."""
+    def _set_status(self, text: str, *, pinned: bool = False) -> None:
+        """Show a status line on the panel and mirror it into the live-view pop-up.
+
+        `pinned` marks a message the user must not miss (the calibration outcome, possibly carrying
+        the over/under aperture advice): the ambient light echo (_on_light_set) declines to replace
+        it. Any other write — every one of them user-driven — replaces and unpins as usual."""
+        self._status_pinned = pinned and bool(text)
         self.status_label.setText(text)
         self.status_label.setVisible(bool(text))  # collapse the strip when there's no message
         self.lv_window.set_status(text)
@@ -1222,8 +1355,11 @@ class ScanlightSidebar(QWidget):
         self._light_has_white = status.get("light_has_white", True)  # RGB-only Scanlights (v1-v3) have no white LED
         self._set_rgb_mode(status["light_ok"])  # Scanlight present → RGB scanning; absent → normal white-light
         self._refresh_light_channels()  # show/hide the W slider + white preset for the connected model
-        self._camera_verified = bool(status["usb_ok"])
-        self._set_cam_status(self._camera_verified, status["usb_model"])
+        claimed = bool(status.get("usb_claimed_elsewhere"))
+        # A body another app holds the claim on is present but not usable: gate Scan/Calibrate
+        # as if it were absent, and let the dot say why instead of a healthy green.
+        self._camera_verified = bool(status["usb_ok"]) and not claimed
+        self._set_cam_status(bool(status["usb_ok"]), status["usb_model"], claimed_elsewhere=claimed)
         if self._camera_verified and not was_verified:
             self._set_status("")  # just connected → drop any stale failure line
         elif was_verified and not self._camera_verified and self.lv_btn.isChecked():
@@ -1235,18 +1371,37 @@ class ScanlightSidebar(QWidget):
 
     @pyqtSlot(object)
     def _on_light_temp(self, temp) -> None:
-        """Show the live Scanlight LED temperature next to the Light status (amber when warm)."""
-        if isinstance(temp, (int, float)):
-            color = "#C8922E" if temp >= 55 else THEME.text_muted  # amber once it's getting warm
+        """Show the live Scanlight LED temperature next to the Light status (amber when warm).
+        RGB-only bodies (v1-v3) have no temperature sensor and report a bogus 0 °C, so hide it there
+        (no white channel is our proxy for those models)."""
+        if isinstance(temp, (int, float)) and self._light_has_white:
+            color = _WARN_COLOR if temp >= 55 else THEME.text_muted  # amber once it's getting warm
             self.light_temp.setStyleSheet(f"color: {color}; font-size: {THEME.font_size_small}px;")
             self.light_temp.setText(f"{temp:.0f} °C")
             self.light_temp.show()
         else:
-            self.light_temp.setText("")  # no light / no telemetry yet
+            self.light_temp.setText("")  # no light / no telemetry yet / RGB-only (no sensor)
             self.light_temp.hide()  # hide the widget entirely so no dark placeholder box lingers
 
-    def _set_cam_status(self, ok: bool, model: str) -> None:
-        """Camera dot: '● Camera (USB)' when a body answered, '● Camera' when none did."""
+    def _set_cam_status(self, ok: bool, model: str, claimed_elsewhere: bool = False) -> None:
+        """Camera dot: '● Camera (USB)' when a body answered, '● Camera' when none did — and
+        '● Camera (in use)' when it sits on the bus but another program holds its USB claim
+        (macOS hands it to Preview/Photos/Image Capture the moment one of them opens). The
+        enumeration behind the dot cannot see a claim, so without this state the dot showed a
+        healthy green while every live-view/scan attempt failed."""
+        if claimed_elsewhere:
+            self._set_conn_status(self.cam_status, False, "Camera (in use)", "Another app is using the camera")
+            # The advice must be readable in the tab, not buried in a tooltip (rig feedback):
+            # the connection hint line turns amber and says what to do instead of the
+            # "plug it in" nudge, which would be wrong advice for a present body.
+            self._conn_hint.setText(
+                "⚠ Another app is using the camera — close Preview, Photos and Image Capture. NegPy reconnects by itself once it is free."
+            )
+            self._conn_hint.setStyleSheet(f"color: {_WARN_COLOR}; font-size: {THEME.font_size_small}px;")
+            self._conn_hint.setVisible(True)
+            return
+        self._conn_hint.setText("Connect the camera by USB, in PC Remote mode — it's detected automatically.")
+        self._conn_hint.setStyleSheet(f"color: {THEME.text_muted}; font-size: {THEME.font_size_small}px;")
         short = "Camera (USB)" if ok else "Camera"
         if ok:
             detail = f"Camera: {model} (USB)" if model else "Camera connected (USB)"

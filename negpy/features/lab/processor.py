@@ -2,15 +2,16 @@ import numpy as np
 
 from negpy.domain.interfaces import PipelineContext
 from negpy.domain.types import ImageBuffer
+from negpy.features.exposure.logic import grade_chroma_damping
 from negpy.features.lab.logic import (
     apply_chroma_denoise,
-    apply_clahe,
     apply_glow_and_halation,
     apply_output_sharpening,
+    apply_rl_sharpening,
     apply_saturation,
     apply_vibrance,
 )
-from negpy.features.lab.models import LabConfig
+from negpy.features.lab.models import LabConfig, SharpenMethod
 
 
 class PhotoLabProcessor:
@@ -29,14 +30,21 @@ class PhotoLabProcessor:
         if self.config.vibrance != 1.0:
             img = apply_vibrance(img, self.config.vibrance)
 
-        if self.config.saturation != 1.0:
-            img = apply_saturation(img, self.config.saturation)
-
-        if self.config.clahe_strength > 0:
-            img = apply_clahe(img, self.config.clahe_strength, context.scale_factor)
+        slopes = context.metrics.get("print_slopes")
+        damp = 1.0 if slopes is None else grade_chroma_damping(slopes[1], self.config.chroma_damping)
+        eff_sat = self.config.saturation * damp
+        if eff_sat != 1.0:
+            img = apply_saturation(img, eff_sat)
 
         if self.config.sharpen > 0:
-            img = apply_output_sharpening(img, self.config.sharpen, context.scale_factor)
+            sharpen = apply_rl_sharpening if self.config.sharpen_method == SharpenMethod.RL else apply_output_sharpening
+            img = sharpen(
+                img,
+                self.config.sharpen,
+                context.scale_factor,
+                radius=self.config.sharpen_radius,
+                masking=self.config.sharpen_masking,
+            )
 
         if self.config.glow_amount > 0 or self.config.halation_strength > 0:
             img = apply_glow_and_halation(img, self.config.glow_amount, self.config.halation_strength, context.scale_factor)
